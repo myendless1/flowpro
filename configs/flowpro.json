@@ -1,0 +1,81 @@
+{
+  "project_root": ".",
+  "pipeline": {"rounds": 3},
+  "distributed": {
+    "enabled": true,
+    "config": "src/wan_va/configs/accelerate_config.json"
+  },
+  "paths": {
+    "sft_dataset": "/media/damoxing/datasets/vae4d/lerobot-vae4d-org/astribot/centrifuge_multidrop-f1",
+    "pretrain": "outputs/pretrain",
+    "rounds": "outputs/rounds",
+    "manifests": "outputs/manifests"
+  },
+  "model": {
+    "base_checkpoint": "checkpoints/wan2.2-va-base",
+    "experiment_config": "src/wan_va/experiment_configs/delta.json",
+    "action_dim": 30,
+    "execution_action_dim": 16
+  },
+  "pretrain": {
+    "config_name": "astribot_train",
+    "batch_size": 4,
+    "num_steps": 10000,
+    "enable_wandb": false
+  },
+  "inference": {
+    "config_name": "astribot",
+    "host": "127.0.0.1",
+    "port": 8006,
+    "startup_timeout_seconds": 600,
+    "state_history_len": 16,
+    "action_num_inference_steps": 10
+  },
+  "collection": {
+    "sdk_root": "",
+    "prompt": "pick up the plate and put it on multidrop",
+    "quest_state_url": "http://127.0.0.1:8080/state",
+    "rollback_capacity": 200,
+    "rollback_horizon": 64,
+    "rollback_rate_hz": 10,
+    "middle_trigger_threshold": 0.5,
+    "control_rate_hz": 100,
+    "policy_rate_hz": 10,
+    "record_rate_hz": 10,
+    "obs_history_len": 1,
+    "replan_steps": 8,
+    "target_pairs": 40,
+    "init_hdf5": "",
+    "init_frame_idx": 0,
+    "left_xyz_low": null,
+    "left_xyz_high": null,
+    "right_xyz_low": null,
+    "right_xyz_high": null,
+    "right_min_z": 0.862,
+    "button_b_index": 5,
+    "button_a_index": 4
+  },
+  "augmentation": {
+    "horizon": 32,
+    "position_weight": 1.0,
+    "rotation_weight": 0.5,
+    "gripper_weight": 0.2,
+    "bridge_fraction": 0.5,
+    "max_position_step": 0.04,
+    "tangent_scale": 1.0
+  },
+  "offline_rl": {
+    "seed": 42,
+    "batch_size": 32,
+    "num_steps": 5000,
+    "learning_rate": 0.00001,
+    "min_learning_rate": 0.000001,
+    "warmup_steps": 100,
+    "cosine_decay_steps": 4000,
+    "beta": 1.0,
+    "lambda_pro": 1.0,
+    "lambda_sft": 1.0,
+    "round1_mix": {"current": 0.8, "sft": 0.2},
+    "later_mix": {"current": 0.7, "history": 0.15, "sft": 0.15}
+  }
+}

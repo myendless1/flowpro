@@ -1,0 +1,19 @@
+{
+  "base_experiment": "absolute.json",
+  "base_config": "astribot_centrifuge_multidrop",
+  "experiment_name": "no4d_crop_view",
+  "save_root": "wam4d-ckpt-1/ablations/no4d-crop-view",
+  "infer_transformer_source_root": "wam4d-ckpt-1/ablations/no4d-crop-view",
+  "variant": "add_crop_views",
+  "obs_cam_keys": [
+    "observation.images.cam_main",
+    "observation.images.cam_left_wrist",
+    "observation.images.cam_right_wrist",
+    "observation.images.right_in_left",
+    "observation.images.right_in_main"
+  ],
+  "crop_view_keys": [
+    "observation.images.right_in_left",
+    "observation.images.right_in_main"
+  ]
+}
