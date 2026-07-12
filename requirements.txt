@@ -8,7 +8,7 @@ accelerate
 deepspeed
 einops
 easydict
-flash_attn
+# Install separately with --no-build-isolation after torch is available.
 tqdm
 imageio[ffmpeg]
 websockets
@@ -20,7 +20,8 @@ safetensors
 Pillow
 h5py>=3.9
 requests>=2.31
-lerobot==0.3.3
+# Install separately with --no-deps after this file. LeRobot 0.3.3 declares
+# torchvision<0.23, while Wan-VA requires the Torch 2.9 / torchvision 0.24 ABI.
 scipy
 wandb
 pytest>=7
