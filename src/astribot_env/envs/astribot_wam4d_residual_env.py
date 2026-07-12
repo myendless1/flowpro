@@ -1366,12 +1366,7 @@ class AstribotWAM4DResidualEnv(gym.Env):
                 gripper_names=gripper_names,
                 gripper_targets=gripper_targets,
             )
-            if command_names:
-                if not hasattr(self.astribot, "set_different_type_command"):
-                    raise RuntimeError(
-                        "Astribot SDK must provide set_different_type_command so EEF and "
-                        "gripper targets can be sent atomically."
-                    )
+            if command_names and self._should_use_mixed_streaming_command(command_arm_names):
                 self.astribot.set_different_type_command(
                     command_names,
                     command_types,
@@ -1380,6 +1375,28 @@ class AstribotWAM4DResidualEnv(gym.Env):
                     use_wbc=use_wbc,
                 )
                 command_api = "set_different_type_command"
+            else:
+                if command_arm_names:
+                    self.astribot.set_cartesian_pose(
+                        command_arm_names,
+                        command_arm_poses,
+                        control_way=self.config.control_way,
+                        use_wbc=use_wbc,
+                        add_default_torso=add_default_torso,
+                    )
+                    command_api = "set_cartesian_pose"
+                if gripper_names:
+                    self.astribot.set_joints_position(
+                        gripper_names,
+                        gripper_targets,
+                        control_way=self.config.control_way,
+                        use_wbc=False,
+                        add_default_torso=add_default_torso,
+                    )
+                    if command_api == "none":
+                        command_api = "set_joints_position"
+                    else:
+                        command_api += "+set_joints_position"
 
             sdk_desired_after = None
             sdk_current_after = None
@@ -1422,6 +1439,14 @@ class AstribotWAM4DResidualEnv(gym.Env):
                         "sdk_current_after": sdk_current_after,
                     }
                 )
+
+    def _should_use_mixed_streaming_command(self, command_arm_names: list[str]) -> bool:
+        if not hasattr(self.astribot, "set_different_type_command"):
+            return False
+        return not (
+            self.config.control_way == "filter"
+            and len(command_arm_names) == 1
+        )
 
     def _merge_streaming_command(
         self,

@@ -359,7 +359,7 @@ class QuestTakeoverController:
             if self.config.robot_command_enabled:
                 self._send_streaming_action(
                     limited_action,
-                    arm_command_mask=None,
+                    arm_command_mask=active_mask,
                     use_wbc=self.config.use_wbc_during_takeover,
                 )
             self._latest_takeover_command_sent = bool(self.config.robot_command_enabled)
@@ -591,12 +591,7 @@ class QuestTakeoverController:
                 for name, pose in zip(command_arm_names, command_arm_poses)
             ]
             print("Quest takeover command " + " | ".join(xyz_parts), flush=True)
-        if command_names:
-            if not hasattr(self.astribot, "set_different_type_command"):
-                raise RuntimeError(
-                    "Astribot SDK must provide set_different_type_command so EEF and "
-                    "gripper targets can be sent atomically."
-                )
+        if command_names and self._should_use_mixed_streaming_command(command_arm_names):
             self.astribot.set_different_type_command(
                 command_names,
                 command_types,
@@ -604,7 +599,32 @@ class QuestTakeoverController:
                 control_way=self.config.control_way,
                 use_wbc=use_wbc,
             )
+        else:
+            if command_arm_names:
+                self.astribot.set_cartesian_pose(
+                    command_arm_names,
+                    command_arm_poses,
+                    control_way=self.config.control_way,
+                    use_wbc=use_wbc,
+                    add_default_torso=False,
+                )
+            if gripper_names:
+                self.astribot.set_joints_position(
+                    gripper_names,
+                    gripper_targets,
+                    control_way=self.config.control_way,
+                    use_wbc=False,
+                    add_default_torso=False,
+                )
         self._last_streaming_command_time = time.time()
+
+    def _should_use_mixed_streaming_command(self, command_arm_names: list[str]) -> bool:
+        if not hasattr(self.astribot, "set_different_type_command"):
+            return False
+        return not (
+            self.config.control_way == "filter"
+            and len(command_arm_names) == 1
+        )
 
     def _merge_streaming_command(
         self,

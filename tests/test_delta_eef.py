@@ -128,6 +128,7 @@ def test_right_only_takeover_sends_a_fixed_left_target_in_complete_mixed_command
     assert names == ["left_arm", "left_gripper", "right_arm", "right_gripper"]
     assert types == ["cartesian", "joints", "cartesian", "joints"]
     np.testing.assert_allclose(commands[0][:3], initial[:3])
+    np.testing.assert_allclose(commands[2][:3], target[8:11])
     assert kwargs == {"control_way": "filter", "use_wbc": False}
     np.testing.assert_allclose(robot.command_target16()[0:8], initial[0:8])
 

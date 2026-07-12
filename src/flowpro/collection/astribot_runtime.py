@@ -238,11 +238,6 @@ class AstribotRobotIO:
         arm_poses, grippers = action16_to_sdk_commands(target, use_xyzw=self.config.use_xyzw)
         arm_names = [self.robot.arm_left_name, self.robot.arm_right_name]
         grip_names = [self.robot.effector_left_name, self.robot.effector_right_name]
-        if not hasattr(self.robot, "set_different_type_command"):
-            raise RuntimeError(
-                "Astribot SDK must provide set_different_type_command so EEF and "
-                "gripper targets can be sent atomically."
-            )
         active = arm_command_mask or {"left": True, "right": True}
         commands = {}
         for index, hand in enumerate(("left", "right")):
@@ -271,6 +266,11 @@ class AstribotRobotIO:
                 add_default_torso=False,
             )
             return
+        if not hasattr(self.robot, "set_different_type_command"):
+            raise RuntimeError(
+                "Astribot SDK must provide set_different_type_command so EEF and "
+                "gripper targets can be sent atomically."
+            )
         order = [name for name in getattr(self.robot, "whole_body_names", []) if name in commands]
         if len(order) != len(commands):
             order = [
@@ -463,8 +463,9 @@ class AstribotRobotIO:
             )
         delta = self._absolute_to_delta(previous, limited)
         self._validate_step(delta, limited, arm_command_mask=active)
-        # Match HIL-SERL direct takeover: submit a complete mixed command while
-        # inactive arms retain their fixed takeover-start targets.
+        # Submit a complete mixed command so the SDK receives one atomic
+        # Cartesian+gripper update. Inactive arms were pinned to `previous`
+        # above, so they hold their takeover-start targets.
         self._send_target(limited)
         self._takeover_limited_target = limited.copy()
         self._last_target = limited.copy()
