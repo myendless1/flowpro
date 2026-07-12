@@ -8,6 +8,14 @@ from flowpro.config import load_config
 from flowpro.training.mixer import batch_counts
 
 
+def _has_transformer_checkpoint(path: Path) -> bool:
+    return (
+        (path / "transformer").is_dir()
+        or (path / "checkpoints" / "last" / "transformer").is_dir()
+        or ((path / "config.json").is_file() and path.is_dir())
+    )
+
+
 def _validate(spec):
     missing=[]
     current=Path(spec["current_preferences"])
@@ -21,7 +29,7 @@ def _validate(spec):
     for name in ("vae","tokenizer","text_encoder"):
         if not (base/name).is_dir(): missing.append(f"base checkpoint component: {base/name}")
     ref=Path(spec["reference_checkpoint"])
-    if not any((p/"transformer").is_dir() for p in (ref,ref/"checkpoints"/"last")):
+    if not _has_transformer_checkpoint(ref):
         missing.append(f"reference transformer: {ref}")
     if missing: raise FileNotFoundError("RPRO preflight failed:\n- " + "\n- ".join(missing))
 

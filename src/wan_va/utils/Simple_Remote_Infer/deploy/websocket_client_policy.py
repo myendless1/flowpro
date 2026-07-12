@@ -50,13 +50,15 @@ class WebsocketClientPolicy:
                 headers = {
                     "Authorization": f"Api-Key {self._api_key}"
                 } if self._api_key else None
-                # 禁用 ping 机制，防止推理时间过长导致超时
+                # websockets 12/13 的 synchronous client has no ping worker.
+                # Passing ``ping_interval`` is interpreted as a socket option
+                # there and makes the connection retry forever.  Keep the
+                # call within the API shared by the robot environment.
                 conn = websockets.sync.client.connect(
                     self._uri,
                     compression=None,
                     max_size=None,
                     additional_headers=headers,
-                    ping_interval=None,
                     close_timeout=10)
                 metadata = unpackb(conn.recv())
                 return conn, metadata

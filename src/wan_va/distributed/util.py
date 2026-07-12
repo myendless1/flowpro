@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -22,7 +24,11 @@ def _configure_model(model, shard_fn, param_dtype, device, eval_mode=True):
 
 
 def init_distributed(world_size, local_rank, rank):
-    # if world_size > 1:
+    if dist.is_initialized():
+        return
+    if world_size == 1:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="nccl",
                             init_method="env://",

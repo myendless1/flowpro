@@ -28,25 +28,36 @@ class RollbackBuffer:
         return list(self.frames)[-n:]
 
     def execute(self, robot: RobotIO, frames: list[Frame]) -> None:
-        # Roll back to recorded pre-action states using one-step delta commands.
+        # Prefer absolute targets so rollback is independent of any lag between
+        # the robot's measured pose and its last command.
         for frame in reversed(frames[:-1]):
-            target = observation_state16(frame)
+            target = rollback_target16(frame)
             if target is not None:
-                robot.execute(delta_to_target(robot.state_action16(), target))
+                execute_absolute = getattr(robot, "execute_absolute", None)
+                if callable(execute_absolute):
+                    execute_absolute(target)
+                else:
+                    robot.execute(delta_to_target(robot.state_action16(), target))
             if self.config.step_interval_s > 0:
                 time.sleep(self.config.step_interval_s)
-        start_state = observation_state16(frames[0]) if frames else None
+        start_state = rollback_target16(frames[0]) if frames else None
         if start_state is not None:
-            robot.execute(delta_to_target(robot.state_action16(), start_state))
+            execute_absolute = getattr(robot, "execute_absolute", None)
+            if callable(execute_absolute):
+                execute_absolute(start_state)
+            else:
+                robot.execute(delta_to_target(robot.state_action16(), start_state))
             if self.config.step_interval_s > 0:
                 time.sleep(self.config.step_interval_s)
 
 
-def observation_state16(frame: Frame):
+def rollback_target16(frame: Frame):
     observation = frame.observation
     if not isinstance(observation, dict):
         return None
-    state = observation.get("state_action16")
+    state = observation.get("_flowpro_rollback_target16")
+    if state is None:
+        state = observation.get("state_action16")
     if state is None:
         history = observation.get("wam4d", {}).get("observation.state", [])
         if len(history):

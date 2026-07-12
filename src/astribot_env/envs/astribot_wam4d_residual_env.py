@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import os
 from pathlib import Path
@@ -12,7 +12,7 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 
-from astribot_env.initial_pose import load_init_joint_target_from_hdf5
+from astribot_env.initial_pose import default_init_joint_action, normalize_init_joint_action
 from astribot_env.manual_control import StdinEpisodeController, prompt_for_success
 from astribot_env.quest_intervention import QuestResidualIntervention
 from astribot_env.rgbd import (
@@ -94,7 +94,6 @@ class AstribotWAM4DResidualEnvConfig:
     residual_rotation_scale: float = 0.5235987755982988
     residual_gripper_deadband: float = 0.5
     action_chunk_steps: int = 32
-    action_chunk_send_batch_size: int = 8
     action_chunk_step_duration: float = 0.1
     first_action_chunk_step_duration: float | None = 0.6
     action_sample_period: float = 0.1
@@ -137,7 +136,9 @@ class AstribotWAM4DResidualEnvConfig:
     quest_neutral_gripper_when_released: bool = True
     quest_verify_ssl: bool = False
     quest_high_freq_control: bool = True
-    quest_control_rate_hz: float = 100.0
+    # `set_different_type_command` is called from this loop; keep it aligned
+    # with the SDK's 250 Hz controller frequency by default.
+    quest_control_rate_hz: float = 250.0
     quest_poll_rate_hz: float = 100.0
     quest_stream_gripper_every_tick: bool = False
     quest_max_translation_step_m: float = 0.01
@@ -145,8 +146,7 @@ class AstribotWAM4DResidualEnvConfig:
     quest_sync_all_arm_targets_on_takeover: bool = False
     debug_takeover_actions: bool = False
     debug_sdk_command_state: bool = False
-    init_hdf5: str = "/home/xddex05/Desktop/data/hdf5_output_multidrop/multidrop_episode_104.hdf5"
-    init_frame_idx: int = 0
+    init_joint_action: list[list[float]] = field(default_factory=default_init_joint_action)
     initial_joint_duration: float = 4.0
     reset_to_initial_on_start: bool = True
     reset_grippers_to_initial_on_start: bool | None = None
@@ -319,12 +319,7 @@ class AstribotWAM4DResidualEnv(gym.Env):
             verify_ssl=self.config.quest_verify_ssl,
         )
         self.manual = StdinEpisodeController(enabled=self.config.manual_control and not self.fake_env)
-        self._initial_joint_target = None
-        if not self.fake_env and self.config.init_hdf5:
-            self._initial_joint_target = load_init_joint_target_from_hdf5(
-                self.config.init_hdf5,
-                frame_idx=self.config.init_frame_idx,
-            )
+        self._initial_joint_target = normalize_init_joint_action(self.config.init_joint_action)
 
     def reset(self, **kwargs):
         super().reset(seed=kwargs.get("seed"))
@@ -809,14 +804,9 @@ class AstribotWAM4DResidualEnv(gym.Env):
             return
         if self.fake_env or self.astribot is None or not bool(self.config.robot_command_enabled):
             return
-        arm_poses, _grippers = action16_to_sdk_commands(current_action16, use_xyzw=self.config.use_xyzw)
-        self.astribot.set_cartesian_pose(
-            [self.astribot.arm_left_name, self.astribot.arm_right_name],
-            arm_poses,
-            control_way=self.config.control_way,
-            use_wbc=False,
-            add_default_torso=False,
-        )
+        # The same takeover tick sends `current_action16` (including grippers)
+        # through the mixed-command API.  Avoid a preceding arm-only command.
+        return
 
     def _constrain_takeover_action(self, action16: np.ndarray) -> np.ndarray:
         action = apply_xyz_limits(
@@ -1376,7 +1366,12 @@ class AstribotWAM4DResidualEnv(gym.Env):
                 gripper_names=gripper_names,
                 gripper_targets=gripper_targets,
             )
-            if command_names and self._should_use_mixed_streaming_command(command_arm_names):
+            if command_names:
+                if not hasattr(self.astribot, "set_different_type_command"):
+                    raise RuntimeError(
+                        "Astribot SDK must provide set_different_type_command so EEF and "
+                        "gripper targets can be sent atomically."
+                    )
                 self.astribot.set_different_type_command(
                     command_names,
                     command_types,
@@ -1385,29 +1380,6 @@ class AstribotWAM4DResidualEnv(gym.Env):
                     use_wbc=use_wbc,
                 )
                 command_api = "set_different_type_command"
-            else:
-                if command_arm_names:
-                    self.astribot.set_cartesian_pose(
-                        command_arm_names,
-                        command_arm_poses,
-                        control_way=self.config.control_way,
-                        use_wbc=use_wbc,
-                        add_default_torso=add_default_torso,
-                    )
-                    command_api = "set_cartesian_pose"
-                if gripper_names:
-                    self.astribot.set_joints_position(
-                        gripper_names,
-                        gripper_targets,
-                        control_way=self.config.control_way,
-                        use_wbc=False,
-                        add_default_torso=False,
-                    )
-                    command_api = (
-                        "set_joints_position"
-                        if command_api == "none"
-                        else f"{command_api}+set_joints_position"
-                    )
 
             sdk_desired_after = None
             sdk_current_after = None
@@ -1450,14 +1422,6 @@ class AstribotWAM4DResidualEnv(gym.Env):
                         "sdk_current_after": sdk_current_after,
                     }
                 )
-
-    def _should_use_mixed_streaming_command(self, command_arm_names: list[str]) -> bool:
-        if not hasattr(self.astribot, "set_different_type_command"):
-            return False
-        return not (
-            self.config.control_way == "filter"
-            and len(command_arm_names) == 1
-        )
 
     def _merge_streaming_command(
         self,
@@ -1517,32 +1481,28 @@ class AstribotWAM4DResidualEnv(gym.Env):
                         grippers[1],
                     ]
                 )
-            batch_size = max(1, int(self.config.action_chunk_send_batch_size))
             first_step_duration = (
                 self.config.first_action_chunk_step_duration
                 if self.step_count <= 1
                 else None
             )
-            for batch_start in range(0, len(waypoints), batch_size):
-                segment_waypoints = waypoints[batch_start : batch_start + batch_size]
-                time_list = []
-                elapsed = 0.0
-                for local_idx in range(len(segment_waypoints)):
-                    global_idx = batch_start + local_idx
-                    step_duration = (
-                        float(first_step_duration)
-                        if global_idx == 0 and first_step_duration is not None
-                        else float(self.config.action_chunk_step_duration)
-                    )
-                    elapsed += step_duration
-                    time_list.append(elapsed)
-                self.astribot.move_cartesian_waypoints(
-                    names,
-                    segment_waypoints,
-                    time_list,
-                    use_wbc=False,
-                    add_default_torso=False,
+            time_list = []
+            elapsed = 0.0
+            for index in range(len(waypoints)):
+                step_duration = (
+                    float(first_step_duration)
+                    if index == 0 and first_step_duration is not None
+                    else float(self.config.action_chunk_step_duration)
                 )
+                elapsed += step_duration
+                time_list.append(elapsed)
+            self.astribot.move_cartesian_waypoints(
+                names,
+                waypoints,
+                time_list,
+                use_wbc=False,
+                add_default_torso=False,
+            )
 
     def _reset_to_initial_joint_pose(self, *, reason: str = "episode reset") -> bool:
         if self._initial_joint_reset_count > 0:
@@ -1565,11 +1525,17 @@ class AstribotWAM4DResidualEnv(gym.Env):
             lifted_action = current_action.copy()
             lifted_action[2] += lift_height
             lifted_action[10] += lift_height
-            arm_poses, _grippers = action16_to_sdk_commands(
+            arm_poses, grippers = action16_to_sdk_commands(
                 lifted_action,
                 use_xyzw=self.config.use_xyzw,
             )
-            arm_names = [self.astribot.arm_left_name, self.astribot.arm_right_name]
+            names = [
+                self.astribot.arm_left_name,
+                self.astribot.effector_left_name,
+                self.astribot.arm_right_name,
+                self.astribot.effector_right_name,
+            ]
+            commands = [arm_poses[0], grippers[0], arm_poses[1], grippers[1]]
             print(
                 "Raising Astribot arms before initial-pose reset: "
                 f"left_z {float(current_action[2]):.3f}->{float(lifted_action[2]):.3f}, "
@@ -1579,19 +1545,24 @@ class AstribotWAM4DResidualEnv(gym.Env):
             )
             if hasattr(self.astribot, "move_cartesian_pose"):
                 self.astribot.move_cartesian_pose(
-                    arm_names,
-                    arm_poses,
+                    names,
+                    commands,
                     duration=duration,
                     use_wbc=False,
                     add_default_torso=False,
                 )
             else:
-                self.astribot.set_cartesian_pose(
-                    arm_names,
-                    arm_poses,
+                if not hasattr(self.astribot, "set_different_type_command"):
+                    raise RuntimeError(
+                        "Astribot SDK must provide a mixed-command API for the "
+                        "pre-reset arm lift."
+                    )
+                self.astribot.set_different_type_command(
+                    names,
+                    ["cartesian", "joints", "cartesian", "joints"],
+                    commands,
                     control_way=self.config.control_way,
                     use_wbc=False,
-                    add_default_torso=False,
                 )
                 if duration > 0.0:
                     time.sleep(duration)
@@ -1601,8 +1572,7 @@ class AstribotWAM4DResidualEnv(gym.Env):
             return False
         assert self.astribot is not None
         print(
-            f"Moving Astribot non-chassis joints to initial pose ({reason}) from {self.config.init_hdf5} "
-            f"frame={self.config.init_frame_idx}.",
+            f"Moving Astribot non-chassis joints to configured initial pose ({reason}).",
             flush=True,
         )
         with self._sdk_command_lock:

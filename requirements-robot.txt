@@ -1,0 +1,17 @@
+# Python 3.8 Astribot / ROS Noetic preference-collection environment.
+# ROS Python packages (rospy, tf, geometry_msgs, and message definitions) are
+# supplied by /opt/ros/noetic after sourcing its setup script, not by pip.
+numpy==1.24.4
+requests>=2.31,<3
+urllib3>=1.26,<3
+websockets>=12,<14
+typing_extensions>=4.13,<5
+msgpack>=1,<2
+opencv-python>=4.8,<4.11
+Pillow>=10,<11
+scipy>=1.10,<1.11
+PyYAML>=6,<7
+colorama>=0.4,<1
+cryptography>=41,<48
+rospkg>=1.5,<2
+catkin_pkg>=1.0,<2

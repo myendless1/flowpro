@@ -3,18 +3,30 @@ import pytest
 from flowpro.collection import InputState, InterventionCollector, Phase
 from flowpro.collection.rollback import RollbackConfig
 from flowpro.data import PairStore
+from wan_va.action_representation import apply_relative_pose7
 
 
 class Robot:
-    def __init__(self): self.action = np.r_[np.zeros(3), [1,0,0,0], 0, np.zeros(3), [1,0,0,0], 0].astype(np.float32); self.n=0
-    def observe(self): self.n += 1; return {"step": self.n}
+    def __init__(self): self.action = np.r_[np.zeros(3), [1,0,0,0], 0, [0.4,0,0], [1,0,0,0], 0].astype(np.float32); self.n=0; self.reset_count=0
+    def observe(self): self.n += 1; return {"step": self.n, "state_action16": self.action.copy()}
     def state_action16(self): return self.action.copy()
-    def execute(self, action): self.action = np.asarray(action).copy()
+    def command_target16(self): return self.action.copy()
+    def execute(self, action):
+        delta = np.asarray(action).copy(); target = self.action.copy()
+        target[0:7] = apply_relative_pose7(target[0:7], delta[0:7]); target[7] = delta[7]
+        target[8:15] = apply_relative_pose7(target[8:15], delta[8:15]); target[15] = delta[15]
+        self.action = target
+    def execute_absolute(self, action): self.action = np.asarray(action).copy()
+    def reset_history(self, action): self.action = np.asarray(action).copy(); self.reset_count += 1
 
 
 class Policy:
-    def reset(self, observation): pass
-    def infer(self, observation): return np.tile(Robot().action, (2,1))
+    def __init__(self): self.reset_count = 0
+    def reset(self, observation): self.reset_count += 1
+    def infer(self, observation):
+        delta = np.zeros(16, np.float32); delta[[3, 11]] = 1
+        state = observation["state_action16"]; delta[[7, 15]] = state[[7, 15]]
+        return np.tile(delta, (2,1))
 
 
 def test_b_middle_a_commits_atomic_pair(tmp_path):
@@ -32,3 +44,50 @@ def test_a_before_takeover_is_rejected(tmp_path):
     c.tick(InputState()); c.tick(InputState(b=True)); c.tick(InputState())
     with pytest.raises(RuntimeError, match="middle-trigger"):
         c.tick(InputState(a=True))
+
+
+def test_start_episode_clears_state_and_resets_runtime(tmp_path):
+    robot = Robot(); policy = Policy()
+    c = InterventionCollector(robot, policy, PairStore(tmp_path), rollback=RollbackConfig(default_horizon=1))
+    c.tick(InputState())
+    c.start_episode()
+    assert c.phase is Phase.POLICY
+    assert len(c.buffer.frames) == 0
+    assert robot.reset_count == 1
+    assert policy.reset_count == 1
+
+
+def test_rollback_buffer_only_keeps_the_current_policy_chunk(tmp_path):
+    class ChunkPolicy(Policy):
+        def __init__(self): super().__init__(); self.calls = 0; self.last_inference_started_chunk = False
+        def infer(self, observation):
+            self.calls += 1
+            self.last_inference_started_chunk = self.calls in (1, 3)
+            return super().infer(observation)
+
+    c = InterventionCollector(Robot(), ChunkPolicy(), PairStore(tmp_path))
+    c.tick(InputState()); c.tick(InputState())
+    assert len(c.buffer.frames) == 2
+    c.tick(InputState())
+    assert len(c.buffer.frames) == 1
+
+
+def test_policy_frame_records_the_commanded_target_for_rollback(tmp_path):
+    robot = Robot(); c = InterventionCollector(robot, Policy(), PairStore(tmp_path))
+    c.tick(InputState())
+    frame = c.buffer.frames[-1]
+    np.testing.assert_allclose(frame.observation["_flowpro_rollback_target16"], robot.action)
+
+
+def test_winner_records_measured_state_delta_not_absolute_quest_target(tmp_path):
+    robot = Robot(); c = InterventionCollector(
+        robot, Policy(), PairStore(tmp_path), rollback=RollbackConfig(default_horizon=1)
+    )
+    c.tick(InputState()); c.tick(InputState(b=True)); c.tick(InputState())
+    target = robot.state_action16(); target[8] += 0.02
+    c.tick(InputState(middle=1, expert_action=target))
+    c.tick(InputState(a=True))
+
+    pair = PairStore(tmp_path).load(next(tmp_path.iterdir()))
+    np.testing.assert_allclose(pair.winner[-1].action[8], 0.02, atol=1e-6)
+    assert abs(float(pair.winner[-1].action[8]) - float(target[8])) > 0.1

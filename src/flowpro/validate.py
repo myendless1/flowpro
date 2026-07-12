@@ -5,6 +5,8 @@ import importlib.util
 from pathlib import Path
 import os
 
+from astribot_env.initial_pose import normalize_init_joint_action
+
 from .config import ProjectConfig
 
 
@@ -26,6 +28,12 @@ def validate_project(cfg: ProjectConfig, *, require_hardware: bool = False) -> l
                         f"rollback_horizon={rollback}, action_horizon={horizon}"))
     checks.append(Check("rollback_capacity", capacity >= rollback,
                         f"capacity={capacity}, horizon={rollback}"))
+    try:
+        normalize_init_joint_action(collection["init_joint_action"])
+    except (KeyError, TypeError, ValueError) as exc:
+        checks.append(Check("initial_joint_action", False, str(exc)))
+    else:
+        checks.append(Check("initial_joint_action", True, "six Astribot non-chassis joint groups"))
     base = cfg.path_for("model.base_checkpoint")
     for component in ("vae", "tokenizer", "text_encoder", "transformer"):
         path = base / component
@@ -33,6 +41,13 @@ def validate_project(cfg: ProjectConfig, *, require_hardware: bool = False) -> l
     sft = cfg.path_for("paths.sft_dataset")
     checks.append(Check("sft_dataset", sft.is_dir(), str(sft)))
     checks.append(Check("sft_text_embedding", (sft / "empty_emb.pt").is_file(), str(sft / "empty_emb.pt")))
+    transformer = cfg.path_for("paths.pretrained_transformer_dir")
+    transformer_ok = (
+        (transformer / "config.json").is_file()
+        or (transformer / "transformer" / "config.json").is_file()
+        or (transformer / "checkpoints" / "last" / "transformer" / "config.json").is_file()
+    )
+    checks.append(Check("pretrained_transformer_dir", transformer_ok, str(transformer)))
     distributed = cfg.path_for("distributed.config")
     checks.append(Check("accelerate_config", distributed.is_file(), str(distributed)))
     for module in ("numpy", "torch", "accelerate", "diffusers", "transformers", "einops", "easydict"):
@@ -47,8 +62,4 @@ def validate_project(cfg: ProjectConfig, *, require_hardware: bool = False) -> l
         sdk_value = str(cfg.section("collection").get("sdk_root", "")).strip() or os.getenv("ASTRIBOT_SDK_ROOT", "")
         sdk = Path(sdk_value).expanduser() if sdk_value else Path("/opt/astribot_sdk")
         checks.append(Check("astribot_sdk", (sdk / "core").is_dir(), str(sdk)))
-        init_hdf5 = str(cfg.section("collection").get("init_hdf5", "")).strip()
-        if init_hdf5:
-            init_path = cfg.path_for("collection.init_hdf5")
-            checks.append(Check("initial_pose", init_path.is_file(), str(init_path)))
     return checks

@@ -14,6 +14,13 @@ from .config import ProjectConfig, load_config
 from .validate import validate_project
 
 
+def _subprocess_env(cfg: ProjectConfig) -> dict[str, str]:
+    src_path = str(cfg.root / "src")
+    existing = os.environ.get("PYTHONPATH", "")
+    pythonpath = src_path if not existing else src_path + os.pathsep + existing
+    return {**os.environ, "PYTHONPATH": pythonpath}
+
+
 def _training_prefix(cfg: ProjectConfig) -> list[str]:
     distributed = cfg.section("distributed")
     if not distributed.get("enabled", True):
@@ -35,21 +42,29 @@ def _run(cfg, stage, command, outputs, round_id, dry_run):
     print(shlex.join(command))
     if dry_run: return
     for value in outputs.values(): Path(value).mkdir(parents=True, exist_ok=True)
-    subprocess.run(command, cwd=cfg.root, env={**os.environ, "PYTHONPATH": str(cfg.root / "src")}, check=True)
+    subprocess.run(command, cwd=cfg.root, env=_subprocess_env(cfg), check=True)
     _write_manifest(cfg, stage, command, outputs, round_id)
 
 
 def pretrain(cfg, round_id, dry_run):
-    s=cfg.section("pretrain"); out=cfg.path_for("paths.pretrain", create=not dry_run)
+    s=cfg.section("pretrain"); out=cfg.path_for("paths.pretrain_save_dir", create=not dry_run)
     cmd=[*_training_prefix(cfg),"-m","wan_va.train","--config-name",s["config_name"],"--experiment-config",str(cfg.path_for("model.experiment_config")),
          "--save-root",str(out),"--dataset-paths",repr([str(cfg.path_for("paths.sft_dataset"))]),"--pretrained-model-path",str(cfg.path_for("model.base_checkpoint")),
          "--batch-size",str(s["batch_size"]),"--num-steps",str(s["num_steps"]),"--enable-wandb",str(s.get("enable_wandb",False)).lower()]
     _run(cfg,"pretrain",cmd,{"checkpoint":out},None,dry_run)
 
 
+def validate(cfg, round_id, dry_run, *, require_hardware: bool = False):
+    checks = validate_project(cfg, require_hardware=require_hardware)
+    for check in checks:
+        print(f"{'OK' if check.ok else 'MISSING':7} {check.name:28} {check.detail}")
+    if not all(check.ok for check in checks):
+        raise RuntimeError("FlowPRO validation failed")
+
+
 def infer(cfg, round_id, dry_run):
     rid=round_id or 1; s=cfg.section("inference"); out=cfg.round_dir(rid,create=not dry_run)/"inference"
-    checkpoint=cfg.path_for("paths.pretrain") if rid == 1 else cfg.round_dir(rid-1)/"offline_rl"
+    checkpoint=cfg.path_for("paths.pretrained_transformer_dir") if rid == 1 else cfg.round_dir(rid-1)/"offline_rl"
     cmd=[sys.executable,"-m","wan_va.wan_va_server","--config-name",s["config_name"],"--experiment-config",str(cfg.path_for("model.experiment_config")),
          "--port",str(s["port"]),"--transformer-source",str(checkpoint),
          "--pretrained-model-path",str(cfg.path_for("model.base_checkpoint")),"--state-history-len",str(s["state_history_len"]),
@@ -64,18 +79,27 @@ def collect(cfg, round_id, dry_run):
          "--rollback-rate-hz",str(s.get("rollback_rate_hz",20)),
          "--trigger-threshold",str(s["middle_trigger_threshold"]),"--control-rate-hz",str(s["control_rate_hz"]),
          "--policy-rate-hz",str(s["policy_rate_hz"]),"--record-rate-hz",str(s.get("record_rate_hz",s["policy_rate_hz"])),
+         "--takeover-rate-hz",str(s.get("takeover_rate_hz",50)),
          "--host",str(cfg.section("inference").get("host","127.0.0.1")),
          "--port",str(cfg.section("inference")["port"]),"--round",str(rid),
          "--prompt",str(s.get("prompt","perform the task")),"--replan-steps",str(s.get("replan_steps",8)),
          "--state-history-len",str(cfg.section("inference")["state_history_len"]),
-         "--obs-history-len",str(s.get("obs_history_len",9))]
+         "--obs-history-len",str(s.get("obs_history_len",9)),
+         "--video-guidance-scale",str(s.get("video_guidance_scale",1)),
+         "--action-guidance-scale",str(s.get("action_guidance_scale",1)),
+         "--takeover-max-translation-step-m",str(s.get("takeover_max_translation_step_m",0.01)),
+         "--takeover-max-rotation-step-deg",str(s.get("takeover_max_rotation_step_deg",2.5)),
+         "--sdk-frequency-hz",str(s.get("sdk_frequency_hz",250)),
+         "--first-policy-waypoint-duration",str(s.get("first_policy_waypoint_duration",0.6)),
+         "--policy-waypoint-duration",str(s.get("policy_waypoint_duration",0.1))]
     if int(s.get("target_pairs",0)) > 0:
         cmd.extend(["--target-pairs",str(s["target_pairs"])])
     if s.get("sdk_root"):
         cmd.extend(["--sdk-root",str(Path(s["sdk_root"]).expanduser())])
-    if s.get("init_hdf5"):
-        cmd.extend(["--init-hdf5",str(cfg.path_for("collection.init_hdf5")),
-                    "--init-frame-idx",str(s.get("init_frame_idx",0))])
+    if s.get("init_joint_action") is not None:
+        cmd.extend(["--init-joint-action", json.dumps(s["init_joint_action"], separators=(",", ":"))])
+    if not bool(s.get("policy_control_left_arm", True)):
+        cmd.append("--disable-policy-left-arm")
     for key, flag in (("left_xyz_low","--left-xyz-low"),("left_xyz_high","--left-xyz-high"),
                       ("right_xyz_low","--right-xyz-low"),("right_xyz_high","--right-xyz-high")):
         if s.get(key) is not None:
@@ -93,24 +117,24 @@ def augment(cfg, round_id, dry_run):
 
 def offline_rl(cfg, round_id, dry_run):
     rid=round_id or 1; s=cfg.section("offline_rl"); out=cfg.round_dir(rid,create=not dry_run)/"offline_rl"
-    ref=cfg.path_for("paths.pretrain") if rid == 1 else cfg.round_dir(rid-1)/"offline_rl"
+    ref=cfg.path_for("paths.pretrained_transformer_dir") if rid == 1 else cfg.round_dir(rid-1)/"offline_rl"
     cmd=[*_training_prefix(cfg),"-m","flowpro.cli.offline_rl","--config",str(cfg.path),"--round",str(rid),"--reference",str(ref),"--output",str(out),
          "--steps",str(s["num_steps"]),"--batch-size",str(s["batch_size"])]
     _run(cfg,"offline_rl",cmd,{"checkpoint":out},rid,dry_run)
 
 
-STAGES={"pretrain":pretrain,"infer":infer,"collect":collect,"augment":augment,"offline-rl":offline_rl}
+STAGES={"validate":validate,"pretrain":pretrain,"infer":infer,"collect":collect,"augment":augment,"offline-rl":offline_rl}
 
 
 def inference_collect(cfg: ProjectConfig, round_id: int, dry_run: bool):
     if dry_run:
         infer(cfg, round_id, True); collect(cfg, round_id, True); return
-    s=cfg.section("inference"); checkpoint=cfg.path_for("paths.pretrain") if round_id == 1 else cfg.round_dir(round_id-1)/"offline_rl"
+    s=cfg.section("inference"); checkpoint=cfg.path_for("paths.pretrained_transformer_dir") if round_id == 1 else cfg.round_dir(round_id-1)/"offline_rl"
     server=[sys.executable,"-m","wan_va.wan_va_server","--config-name",s["config_name"],"--experiment-config",str(cfg.path_for("model.experiment_config")),
             "--port",str(s["port"]),"--transformer-source",str(checkpoint),
             "--pretrained-model-path",str(cfg.path_for("model.base_checkpoint")),"--state-history-len",str(s["state_history_len"]),
             "--action-num-inference-steps",str(s["action_num_inference_steps"])]
-    env={**os.environ,"PYTHONPATH":str(cfg.root/"src")}; process=subprocess.Popen(server,cwd=cfg.root,env=env)
+    env=_subprocess_env(cfg); process=subprocess.Popen(server,cwd=cfg.root,env=env)
     try:
         deadline=time.monotonic()+float(s.get("startup_timeout_seconds",600))
         while time.monotonic()<deadline:
@@ -128,7 +152,7 @@ def inference_collect(cfg: ProjectConfig, round_id: int, dry_run: bool):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument("stage",choices=[*STAGES,"round","all"]); p.add_argument("--config",default="configs/flowpro.json")
-    p.add_argument("--round",type=int,default=1); p.add_argument("--dry-run",action="store_true"); a=p.parse_args(); cfg=load_config(a.config)
+    p.add_argument("--round",type=int,default=1); p.add_argument("--dry-run",action="store_true"); p.add_argument("--hardware",action="store_true"); a=p.parse_args(); cfg=load_config(a.config)
     if not a.dry_run and a.stage in {"round", "all"}:
         failed = [check for check in validate_project(cfg, require_hardware=True) if not check.ok]
         if failed:
@@ -142,6 +166,8 @@ def main():
         for rid in range(1,int(cfg.section("pipeline")["rounds"])+1):
             inference_collect(cfg,rid,a.dry_run)
             for name in ("augment","offline-rl"): STAGES[name](cfg,rid,a.dry_run)
+    elif a.stage=="validate":
+        validate(cfg,a.round,a.dry_run,require_hardware=a.hardware)
     else: STAGES[a.stage](cfg,a.round,a.dry_run)
 
 if __name__ == "__main__": main()

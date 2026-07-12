@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import threading
 import time
 from typing import Any
 
 import numpy as np
 
-from astribot_env.initial_pose import load_init_joint_target_from_hdf5
+from astribot_env.initial_pose import default_init_joint_action, normalize_init_joint_action
 from astribot_env.quest_intervention import QuestResidualIntervention
 from astribot_env.rgbd import get_current_eef_state
 from astribot_env.sdk_loader import DEFAULT_ASTRIBOT_SDK_ROOT, load_astribot_class
@@ -111,8 +111,7 @@ class QuestTakeoverConfig:
     quest_max_translation_step_m: float = 0.01
     quest_max_rotation_step_deg: float = 2.5
     quest_sync_all_arm_targets_on_takeover: bool = False
-    init_hdf5: str = ""
-    init_frame_idx: int = 0
+    init_joint_action: list[list[float]] = field(default_factory=default_init_joint_action)
     initial_joint_duration: float = 4.0
     reset_to_initial_on_start: bool = True
     reset_to_initial_on_episode_end: bool = True
@@ -154,7 +153,7 @@ class QuestTakeoverController:
         self._last_streaming_command_time: float | None = None
 
         self.astribot = None
-        self._initial_joint_target = None
+        self._initial_joint_target = normalize_init_joint_action(self.config.init_joint_action)
         self.quest = QuestResidualIntervention(
             state_url=self.config.quest_state_url,
             trigger_threshold=self.config.quest_trigger_threshold,
@@ -211,11 +210,6 @@ class QuestTakeoverController:
             self.astribot.set_filter_parameters(
                 float(self.config.robot_filter_scale),
                 float(self.config.robot_gripper_filter_scale),
-            )
-        if self.config.init_hdf5:
-            self._initial_joint_target = load_init_joint_target_from_hdf5(
-                self.config.init_hdf5,
-                frame_idx=self.config.init_frame_idx,
             )
 
     def _run_loop(self) -> None:
@@ -597,7 +591,12 @@ class QuestTakeoverController:
                 for name, pose in zip(command_arm_names, command_arm_poses)
             ]
             print("Quest takeover command " + " | ".join(xyz_parts), flush=True)
-        if command_names and self._should_use_mixed_streaming_command(command_arm_names):
+        if command_names:
+            if not hasattr(self.astribot, "set_different_type_command"):
+                raise RuntimeError(
+                    "Astribot SDK must provide set_different_type_command so EEF and "
+                    "gripper targets can be sent atomically."
+                )
             self.astribot.set_different_type_command(
                 command_names,
                 command_types,
@@ -605,32 +604,7 @@ class QuestTakeoverController:
                 control_way=self.config.control_way,
                 use_wbc=use_wbc,
             )
-        else:
-            if command_arm_names:
-                self.astribot.set_cartesian_pose(
-                    command_arm_names,
-                    command_arm_poses,
-                    control_way=self.config.control_way,
-                    use_wbc=use_wbc,
-                    add_default_torso=False,
-                )
-            if gripper_names:
-                self.astribot.set_joints_position(
-                    gripper_names,
-                    gripper_targets,
-                    control_way=self.config.control_way,
-                    use_wbc=False,
-                    add_default_torso=False,
-                )
         self._last_streaming_command_time = time.time()
-
-    def _should_use_mixed_streaming_command(self, command_arm_names: list[str]) -> bool:
-        if not hasattr(self.astribot, "set_different_type_command"):
-            return False
-        return not (
-            self.config.control_way == "filter"
-            and len(command_arm_names) == 1
-        )
 
     def _merge_streaming_command(
         self,
@@ -672,21 +646,15 @@ class QuestTakeoverController:
     def _sync_takeover_targets_to_current_pose(self, current_action16: np.ndarray) -> None:
         if self.astribot is None:
             return
-        arm_poses, _grippers = action16_to_sdk_commands(current_action16, use_xyzw=self.config.use_xyzw)
-        self.astribot.set_cartesian_pose(
-            [self.astribot.arm_left_name, self.astribot.arm_right_name],
-            arm_poses,
-            control_way=self.config.control_way,
-            use_wbc=False,
-            add_default_torso=False,
-        )
+        # The next control tick submits the current complete target atomically.
+        # Do not emit an extra arm-only SDK command here.
+        return
 
     def _move_to_initial_joint_pose(self, *, reason: str = "episode reset") -> None:
         if not self.config.robot_command_enabled or self._initial_joint_target is None or self.astribot is None:
             return
         print(
-            f"Moving Astribot non-chassis joints to initial pose ({reason}) from {self.config.init_hdf5} "
-            f"frame={self.config.init_frame_idx}.",
+            f"Moving Astribot non-chassis joints to configured initial pose ({reason}).",
             flush=True,
         )
         with self._sdk_command_lock:

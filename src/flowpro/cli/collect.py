@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import select
 import signal
+import sys
 import time
 
 import numpy as np
@@ -16,6 +19,14 @@ from flowpro.collection.astribot_runtime import (
 from flowpro.collection.controller import InputState, InterventionCollector, Phase
 from flowpro.collection.rollback import RollbackConfig
 from flowpro.data import PairStore
+from astribot_env.initial_pose import normalize_init_joint_action
+
+
+def _init_joint_action(value: str) -> list[list[float]]:
+    try:
+        return normalize_init_joint_action(json.loads(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid --init-joint-action: {exc}") from exc
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,13 +43,25 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--trigger-threshold", type=float, default=.5)
     p.add_argument("--control-rate-hz", type=float, default=10)
     p.add_argument("--policy-rate-hz", type=float, default=10)
+    p.add_argument("--takeover-rate-hz", type=float, default=50)
     p.add_argument("--record-rate-hz", type=float, default=10)
     p.add_argument("--replan-steps", type=int, default=8)
     p.add_argument("--state-history-len", type=int, default=16)
     p.add_argument("--obs-history-len", type=int, default=9)
+    p.add_argument("--video-guidance-scale", type=float, default=1.0)
+    p.add_argument("--action-guidance-scale", type=float, default=1.0)
+    p.add_argument("--takeover-max-translation-step-m", type=float, default=.01)
+    p.add_argument("--takeover-max-rotation-step-deg", type=float, default=2.5)
+    p.add_argument("--sdk-frequency-hz", type=float, default=250)
+    p.add_argument("--first-policy-waypoint-duration", type=float, default=.6)
+    p.add_argument("--policy-waypoint-duration", type=float, default=.1)
+    p.add_argument("--disable-policy-left-arm", action="store_true")
     p.add_argument("--sdk-root", default="")
-    p.add_argument("--init-hdf5", default="")
-    p.add_argument("--init-frame-idx", type=int, default=0)
+    p.add_argument(
+        "--init-joint-action",
+        type=_init_joint_action,
+        help="JSON six-group target: torso, left arm, left gripper, right arm, right gripper, head",
+    )
     p.add_argument("--left-xyz-low", type=float, nargs=3)
     p.add_argument("--left-xyz-high", type=float, nargs=3)
     p.add_argument("--right-xyz-low", type=float, nargs=3)
@@ -71,6 +94,20 @@ def _run_fake(args: argparse.Namespace) -> int:
     return args.fake_pairs
 
 
+def _wait_for_enter(prompt: str, stopped) -> bool:
+    if not sys.stdin.isatty():
+        raise RuntimeError("interactive episode collection requires a terminal on stdin")
+    print(prompt, flush=True)
+    while not stopped():
+        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+        if not ready:
+            continue
+        if sys.stdin.readline() == "":
+            return False
+        return True
+    return False
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.fake:
@@ -83,17 +120,26 @@ def main() -> None:
 
     runtime = AstribotRuntimeConfig(
         sdk_root=args.sdk_root or AstribotRuntimeConfig.sdk_root,
-        init_hdf5=args.init_hdf5, init_frame_idx=args.init_frame_idx,
+        sdk_frequency=args.sdk_frequency_hz,
+        init_joint_action=args.init_joint_action or AstribotRuntimeConfig().init_joint_action,
+        reset_to_initial_on_startup=False,
         left_xyz_low=args.left_xyz_low, left_xyz_high=args.left_xyz_high,
         right_xyz_low=args.right_xyz_low, right_xyz_high=args.right_xyz_high,
         right_min_z=args.right_min_z,
+        takeover_max_translation_step_m=args.takeover_max_translation_step_m,
+        takeover_max_rotation_step_deg=args.takeover_max_rotation_step_deg,
+        first_policy_waypoint_duration=args.first_policy_waypoint_duration,
+        policy_waypoint_duration=args.policy_waypoint_duration,
         state_history_len=args.state_history_len,
         obs_history_len=args.obs_history_len,
     )
     robot = AstribotRobotIO(runtime)
     policy = WanVAPolicy(host=args.host, port=args.port, prompt=args.prompt,
                          replan_steps=args.replan_steps, state_history_len=args.state_history_len,
-                         obs_history_len=args.obs_history_len)
+                         obs_history_len=args.obs_history_len,
+                         control_left_arm=not args.disable_policy_left_arm,
+                         video_guidance_scale=args.video_guidance_scale,
+                         action_guidance_scale=args.action_guidance_scale)
     controls = QuestControlSource(robot, state_url=args.quest_state_url,
                                   trigger_threshold=args.trigger_threshold)
     collector = InterventionCollector(
@@ -112,38 +158,90 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop)
     period = 1.0 / max(args.control_rate_hz, 1e-6)
     policy_period = 1.0 / max(args.policy_rate_hz, 1e-6)
+    takeover_period = 1.0 / max(args.takeover_rate_hz, 1e-6)
     record_period = 1.0 / max(args.record_rate_hz, 1e-6)
-    next_policy = next_record = time.monotonic()
     initial_pairs = sum(1 for path in PairStore(args.output).root.iterdir()
                         if path.is_dir() and (path / "metadata.json").exists())
-    print("Collector active: B=rollback, hold middle=takeover, A=commit, Ctrl-C=stop", flush=True)
+    committed = initial_pairs
+    episode = 1
+    print(
+        "Collector ready: Enter=reset/start gates, B=rollback, "
+        "hold middle=takeover, A=commit and stop episode, Ctrl-C=stop",
+        flush=True,
+    )
     try:
         while not stopped:
-            started = time.monotonic()
-            now = time.monotonic()
-            control = controls.poll()
-            should_tick = collector.phase is not Phase.POLICY or control.b or now >= next_policy
-            if collector.phase in (Phase.ROLLED_BACK, Phase.TAKEOVER):
-                control.record = now >= next_record
-                if control.record:
-                    next_record = now + record_period
-            if should_tick:
-                collector.tick(control)
-                if collector.phase is Phase.POLICY:
-                    next_policy = now + policy_period
-            if args.target_pairs > 0:
-                committed = sum(1 for path in PairStore(args.output).root.iterdir()
-                                if path.is_dir() and (path / "metadata.json").exists())
-                if committed - initial_pairs >= args.target_pairs:
-                    print(f"Target reached: {args.target_pairs} new preference pairs", flush=True)
-                    break
-            time.sleep(max(0.0, period - (time.monotonic() - started)))
+            if not _wait_for_enter(
+                f"[Episode {episode}] Press Enter to move the robot to the initial pose.",
+                lambda: stopped,
+            ):
+                break
+            print(f"[Episode {episode}] Moving to the initial pose...", flush=True)
+            robot.move_to_initial_pose()
+            print(f"[Episode {episode}] Initial pose reached.", flush=True)
+
+            if not _wait_for_enter(
+                f"[Episode {episode}] Prepare the scene, then press Enter to start policy inference.",
+                lambda: stopped,
+            ):
+                break
+            controls.reset()
+            collector.start_episode()
+            print(
+                f"[Episode {episode}] Policy active: B=rollback, hold middle=takeover, "
+                "A=save and stop this episode.",
+                flush=True,
+            )
+
+            # Quest is polled faster than the policy action stream. Only policy
+            # and takeover ticks issue commands, matching the SDK frequency.
+            next_policy = next_takeover = next_record = time.monotonic()
+            episode_complete = False
+            while not stopped and not episode_complete:
+                started = time.monotonic()
+                now = time.monotonic()
+                control = controls.poll()
+                command_due = (
+                    now >= next_policy
+                    if collector.phase is Phase.POLICY
+                    else now >= next_takeover
+                )
+                if collector.phase in (Phase.ROLLED_BACK, Phase.TAKEOVER):
+                    control.record = now >= next_record
+                    if control.record:
+                        next_record = now + record_period
+                if command_due:
+                    previous_phase = collector.phase
+                    collector.tick(control)
+                    episode_complete = (
+                        control.a
+                        and previous_phase in (Phase.ROLLED_BACK, Phase.TAKEOVER)
+                        and collector.phase is Phase.POLICY
+                    )
+                    if collector.phase is Phase.POLICY:
+                        next_policy = now + policy_period
+                    else:
+                        next_takeover = now + takeover_period
+                time.sleep(max(0.0, period - (time.monotonic() - started)))
+
+            if stopped:
+                break
+            committed += 1
+            print(f"[Episode {episode}] Pair saved; policy control stopped.", flush=True)
+            if args.target_pairs > 0 and committed - initial_pairs >= args.target_pairs:
+                print(f"Target reached: {args.target_pairs} new preference pairs", flush=True)
+                break
+            episode += 1
     finally:
         # Re-issue the measured pose so a filtered Cartesian controller holds
         # position if Quest disconnects, the operator interrupts, or a safety
         # check aborts collection.
         try:
-            robot.execute(robot.state_action16())
+            state = robot.state_action16()
+            hold_delta = np.zeros((16,), dtype=np.float32)
+            hold_delta[[3, 11]] = 1.0
+            hold_delta[[7, 15]] = state[[7, 15]]
+            robot.execute(hold_delta)
         except Exception as exc:
             print(f"WARNING: failed to send final hold command: {exc}", flush=True)
 

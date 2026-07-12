@@ -253,17 +253,23 @@ def run_rpro(spec_path: str | Path, *, config_name: str, experiment_config: str)
     config.dataset_paths = [spec["sft_dataset"]]
     config.empty_emb_path = str(Path(spec["sft_dataset"]) / "empty_emb.pt")
     reference_root = Path(spec["reference_checkpoint"])
-    for candidate in (reference_root / "checkpoints" / "last", reference_root):
-        if (candidate / "transformer").exists():
-            reference_root = candidate
+    transformer_source = None
+    for candidate in (
+        reference_root / "checkpoints" / "last" / "transformer",
+        reference_root / "transformer",
+        reference_root,
+    ):
+        if candidate.is_dir() and (candidate / "config.json").is_file():
+            transformer_source = candidate
             break
-    if not (reference_root / "transformer").exists():
+    if transformer_source is None:
         raise FileNotFoundError(
-            "Reference checkpoint must contain transformer/ or checkpoints/last/transformer: "
+            "Reference checkpoint must be a transformer directory or contain "
+            "transformer/ or checkpoints/last/transformer: "
             f"{spec['reference_checkpoint']}"
         )
     config.wan22_pretrained_model_name_or_path = spec["base_checkpoint"]
-    config.transformer_source_path = str(reference_root / "transformer")
+    config.transformer_source_path = str(transformer_source)
     config.save_root = spec["output"]
     config.num_steps = int(spec["steps"])
     config.batch_size = int(spec["batch_size"])

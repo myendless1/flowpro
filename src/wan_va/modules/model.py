@@ -18,10 +18,19 @@ from einops import rearrange
 
 from .attn_mask import FlexAttnMaskManager
 
-try:
-    from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+
+def _load_flash_attn_func():
+    try:
+        from flash_attn_interface import flash_attn_func
+    except ImportError:
+        try:
+            from flash_attn import flash_attn_func
+        except ImportError as exc:
+            raise ImportError(
+                "attn_mode='flashattn' requires flash_attn_interface or flash_attn "
+                "to be installed. Use attn_mode='torch' to run with PyTorch SDPA."
+            ) from exc
+    return flash_attn_func
 
 __all__ = ['WanTransformer3DModel']
 
@@ -133,7 +142,7 @@ class WanAttention(torch.nn.Module):
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
-            self.attn_op = flash_attn_func
+            self.attn_op = _load_flash_attn_func()
         elif attn_mode == 'flex':
             self.attn_op = lambda q, k, v: FlexAttnMaskManager.run_attention(
                 q,

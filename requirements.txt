@@ -1,3 +1,6 @@
+# Python 3.10 training and Wan-VA inference environment.
+# Do not install this file into the Python 3.8 Astribot/ROS environment;
+# use requirements-robot.txt there instead.
 numpy==1.26.4
 torch==2.9.0
 torchvision==0.24.0

@@ -12,7 +12,7 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 train = ["torch==2.9.0", "torchvision==0.24.0", "diffusers", "transformers", "accelerate",
          "einops", "easydict", "tqdm", "imageio[ffmpeg]", "safetensors", "wandb"]
-robot = ["requests>=2.31", "websockets>=12", "msgpack", "opencv-python", "h5py>=3.9", "pillow>=10"]
+robot = ["requests>=2.31", "websockets>=12", "msgpack", "opencv-python", "pillow>=10"]
 test = ["pytest>=7"]
 
 [project.scripts]

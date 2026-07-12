@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import builtins
+import importlib.util
 import os
 from pathlib import Path
+import subprocess
 import sys
 import types
 from typing import Any
@@ -28,11 +30,41 @@ def _make_package_alias(name: str, path: Path) -> None:
     sys.modules[name] = module
 
 
+def _load_ros_environment(sdk_root: Path) -> None:
+    """Load ROS Noetic and SDK setup output when the caller did not source it."""
+    if importlib.util.find_spec("tf") is not None:
+        return
+
+    ros_setup = Path("/opt/ros/noetic/setup.bash")
+    sdk_setup = sdk_root / "env.sh"
+    if not ros_setup.is_file() or not sdk_setup.is_file():
+        return
+
+    command = 'source /opt/ros/noetic/setup.bash && source "$1" >/dev/null && env -0'
+    result = subprocess.run(
+        ["bash", "-c", command, "bash", str(sdk_setup)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    for entry in result.stdout.split(b"\0"):
+        if not entry:
+            continue
+        key, value = entry.split(b"=", 1)
+        os.environ[key.decode()] = value.decode(errors="surrogateescape")
+
+    python_paths = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    for path in reversed(python_paths):
+        if path:
+            _prepend_python_path(Path(path))
+
+
 def ensure_astribot_sdk_path(sdk_root: str | os.PathLike[str] | None = None) -> Path:
     root = Path(sdk_root or os.environ.get("ASTRIBOT_SDK_ROOT", DEFAULT_ASTRIBOT_SDK_ROOT)).expanduser().resolve()
     if not (root / "core").is_dir():
         raise RuntimeError(f"Astribot SDK path does not look valid: {root}")
 
+    _load_ros_environment(root)
     _prepend_python_path(root)
     _prepend_python_path(root / "astribot_msgs" / "build" / "devel" / "lib" / "python3" / "dist-packages")
     _prepend_python_path(root / "core" / "common")
