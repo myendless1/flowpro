@@ -89,7 +89,6 @@ def collect(cfg, round_id, dry_run):
          "--action-guidance-scale",str(s.get("action_guidance_scale",1)),
          "--takeover-max-translation-step-m",str(s.get("takeover_max_translation_step_m",0.01)),
          "--takeover-max-rotation-step-deg",str(s.get("takeover_max_rotation_step_deg",2.5)),
-         "--sdk-frequency-hz",str(s.get("sdk_frequency_hz",250)),
          "--first-policy-waypoint-duration",str(s.get("first_policy_waypoint_duration",0.6)),
          "--policy-waypoint-duration",str(s.get("policy_waypoint_duration",0.1))]
     if int(s.get("target_pairs",0)) > 0:

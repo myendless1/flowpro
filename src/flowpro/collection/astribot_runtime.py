@@ -190,13 +190,25 @@ class AstribotRobotIO:
         delta[8:15] = relative_pose7(reference[8:15], target[8:15])
         return delta
 
-    def _validate_step(self, delta: np.ndarray, target: np.ndarray) -> None:
-        if np.any(delta[[7, 15]] < 0) or np.any(delta[[7, 15]] > 1):
-            raise ValueError(f"Gripper targets must be in [0,1], got {delta[[7, 15]]}")
-        for off, low, high in (
-            (0, self.config.left_xyz_low, self.config.left_xyz_high),
-            (8, self.config.right_xyz_low, self.config.right_xyz_high),
+    def _validate_step(
+        self,
+        delta: np.ndarray,
+        target: np.ndarray,
+        *,
+        arm_command_mask: dict[str, bool] | None = None,
+    ) -> None:
+        active = arm_command_mask or {"left": True, "right": True}
+        grip_indices = [7 if hand == "left" else 15 for hand in ("left", "right") if active.get(hand, False)]
+        if grip_indices and (
+            np.any(delta[grip_indices] < 0) or np.any(delta[grip_indices] > 1)
         ):
+            raise ValueError(f"Gripper targets must be in [0,1], got {delta[grip_indices]}")
+        for hand, off, low, high in (
+            ("left", 0, self.config.left_xyz_low, self.config.left_xyz_high),
+            ("right", 8, self.config.right_xyz_low, self.config.right_xyz_high),
+        ):
+            if not active.get(hand, False):
+                continue
             xyz = target[off : off + 3]
             if low is not None and np.any(xyz < np.asarray(low)):
                 raise ValueError(f"Arm@{off} target below workspace lower bound: {xyz}")
@@ -217,7 +229,12 @@ class AstribotRobotIO:
             if self.config.max_rotation_step_deg > 0 and angle > self.config.max_rotation_step_deg:
                 raise ValueError(f"Unsafe rotation step for arm@{off}: {angle:.2f}deg")
 
-    def _send_target(self, target: np.ndarray) -> None:
+    def _send_target(
+        self,
+        target: np.ndarray,
+        *,
+        arm_command_mask: dict[str, bool] | None = None,
+    ) -> None:
         arm_poses, grippers = action16_to_sdk_commands(target, use_xyzw=self.config.use_xyzw)
         arm_names = [self.robot.arm_left_name, self.robot.arm_right_name]
         grip_names = [self.robot.effector_left_name, self.robot.effector_right_name]
@@ -226,15 +243,41 @@ class AstribotRobotIO:
                 "Astribot SDK must provide set_different_type_command so EEF and "
                 "gripper targets can be sent atomically."
             )
-        commands = {
-            arm_names[0]: ("cartesian", arm_poses[0]),
-            arm_names[1]: ("cartesian", arm_poses[1]),
-            grip_names[0]: ("joints", grippers[0]),
-            grip_names[1]: ("joints", grippers[1]),
-        }
+        active = arm_command_mask or {"left": True, "right": True}
+        commands = {}
+        for index, hand in enumerate(("left", "right")):
+            if active.get(hand, False):
+                commands[arm_names[index]] = ("cartesian", arm_poses[index])
+                commands[grip_names[index]] = ("joints", grippers[index])
+        if not commands:
+            return
+        active_indices = [
+            index for index, hand in enumerate(("left", "right")) if active.get(hand, False)
+        ]
+        if self.config.control_way == "filter" and len(active_indices) == 1:
+            index = active_indices[0]
+            self.robot.set_cartesian_pose(
+                [arm_names[index]],
+                [arm_poses[index]],
+                control_way=self.config.control_way,
+                use_wbc=False,
+                add_default_torso=False,
+            )
+            self.robot.set_joints_position(
+                [grip_names[index]],
+                [grippers[index]],
+                control_way=self.config.control_way,
+                use_wbc=False,
+                add_default_torso=False,
+            )
+            return
         order = [name for name in getattr(self.robot, "whole_body_names", []) if name in commands]
         if len(order) != len(commands):
-            order = [arm_names[0], grip_names[0], arm_names[1], grip_names[1]]
+            order = [
+                name
+                for name in (arm_names[0], grip_names[0], arm_names[1], grip_names[1])
+                if name in commands
+            ]
         self.robot.set_different_type_command(
             order,
             [commands[name][0] for name in order],
@@ -267,6 +310,25 @@ class AstribotRobotIO:
             reference = target
         targets_array = np.asarray(targets, np.float32)
 
+        durations = []
+        for index in range(len(targets_array)):
+            durations.append(
+                float(self.config.first_policy_waypoint_duration)
+                if self._policy_chunk_count == 0 and index == 0
+                else float(self.config.policy_waypoint_duration)
+            )
+        self._execute_absolute_waypoint_trajectory(targets_array, durations)
+        self._policy_chunk_count += 1
+        return targets_array
+
+    def _execute_absolute_waypoint_trajectory(
+        self,
+        targets16: np.ndarray,
+        step_durations: list[float],
+    ) -> None:
+        targets_array = np.asarray(targets16, np.float32).reshape(-1, ACTION16_DIM)
+        if len(targets_array) != len(step_durations) or not len(targets_array):
+            raise ValueError("Waypoint targets and durations must have equal non-zero lengths")
         names = [
             self.robot.torso_name,
             self.robot.arm_left_name,
@@ -276,7 +338,9 @@ class AstribotRobotIO:
         ]
         torso_pose = self.robot.get_desired_cartesian_pose([self.robot.torso_name])[0]
         waypoints = []
+        reference = self._last_target.copy()
         for target in targets_array:
+            self._validate_step(self._absolute_to_delta(reference, target), target)
             arm_poses, grippers = action16_to_sdk_commands(
                 target, use_xyzw=self.config.use_xyzw
             )
@@ -287,29 +351,34 @@ class AstribotRobotIO:
                 np.asarray(arm_poses[1]).tolist(),
                 np.asarray(grippers[1]).tolist(),
             ])
+            reference = target
 
-        durations = []
+        time_list = []
         elapsed = 0.0
-        for index in range(len(waypoints)):
-            duration = (
-                float(self.config.first_policy_waypoint_duration)
-                if self._policy_chunk_count == 0 and index == 0
-                else float(self.config.policy_waypoint_duration)
-            )
-            elapsed += duration
-            durations.append(elapsed)
+        for duration in step_durations:
+            elapsed += float(duration)
+            time_list.append(elapsed)
         self.robot.move_cartesian_waypoints(
             names,
             waypoints,
-            durations,
+            time_list,
             use_wbc=True,
             add_default_torso=False,
         )
-        self._policy_chunk_count += 1
         self._last_target = targets_array[-1].copy()
         for target in targets_array:
             self.action_history.append(target.copy())
-        return targets_array
+
+    def execute_rollback_waypoints(
+        self,
+        targets16: np.ndarray,
+        *,
+        step_duration_s: float,
+    ) -> None:
+        """Submit a reversed absolute chunk as one continuous SDK trajectory."""
+        targets = np.asarray(targets16, np.float32).reshape(-1, ACTION16_DIM)
+        duration = max(float(step_duration_s), 1e-3)
+        self._execute_absolute_waypoint_trajectory(targets, [duration] * len(targets))
 
     def execute_absolute(self, action16: np.ndarray) -> None:
         """Send an absolute target and make it the base for subsequent deltas."""
@@ -352,7 +421,12 @@ class AstribotRobotIO:
         )
         return value.astype(np.float32)
 
-    def execute_takeover_absolute(self, action16: np.ndarray) -> None:
+    def execute_takeover_absolute(
+        self,
+        action16: np.ndarray,
+        *,
+        arm_command_mask: dict[str, bool] | None = None,
+    ) -> None:
         """Stream a rate-limited teleoperation target anchored on measured state."""
         if self._takeover_limited_target is None:
             self.begin_takeover()
@@ -360,7 +434,11 @@ class AstribotRobotIO:
         previous = self._takeover_limited_target
         target = np.asarray(action16, np.float32).reshape(ACTION16_DIM).copy()
         limited = target.copy()
-        for off in (0, 8):
+        active = arm_command_mask or {"left": True, "right": True}
+        for hand, off in (("left", 0), ("right", 8)):
+            if not active.get(hand, False):
+                limited[off : off + 8] = previous[off : off + 8]
+                continue
             delta_xyz = target[off : off + 3] - previous[off : off + 3]
             distance = float(np.linalg.norm(delta_xyz))
             max_translation = float(self.config.takeover_max_translation_step_m)
@@ -378,8 +456,15 @@ class AstribotRobotIO:
                     target[off + 3 : off + 7],
                     max_rotation / angle,
                 )
+        if active.get("right", False) and self.config.right_min_z is not None:
+            minimum_z = np.float32(self.config.right_min_z)
+            limited[10] = max(
+                limited[10], np.nextafter(minimum_z, np.float32(np.inf))
+            )
         delta = self._absolute_to_delta(previous, limited)
-        self._validate_step(delta, limited)
+        self._validate_step(delta, limited, arm_command_mask=active)
+        # Match HIL-SERL direct takeover: submit a complete mixed command while
+        # inactive arms retain their fixed takeover-start targets.
         self._send_target(limited)
         self._takeover_limited_target = limited.copy()
         self._last_target = limited.copy()
@@ -489,7 +574,6 @@ class QuestControlSource:
         for hand, off, roff in (("left", 0, 0), ("right", 8, 7)):
             hand_info = info.get(hand, {})
             if not hand_info.get("active", False):
-                target[off : off + 8] = self.robot.state_action16()[off : off + 8]
                 continue
             delta_xyz = np.asarray(hand_info.get("relative_position", residual[roff:roff+3] * .2))
             delta_rot = np.asarray(hand_info.get("scaled_rotvec", residual[roff+3:roff+6] * np.deg2rad(30)))
@@ -512,6 +596,12 @@ class QuestControlSource:
         else:
             self.consecutive_errors = 0
         buttons = info.get("episode_buttons", {})
+        active_arms = info.get("active_arms")
+        if not isinstance(active_arms, dict):
+            active_arms = {
+                hand: bool((info.get(hand) or {}).get("active", False))
+                for hand in ("left", "right")
+            }
         if not active:
             self.anchor = None
         return InputState(
@@ -519,6 +609,7 @@ class QuestControlSource:
             a=bool(buttons.get("success_value", 0) >= .5),
             middle=1.0 if active else 0.0,
             expert_action=self._expert_action(residual, info) if active else None,
+            active_arms={hand: bool(active_arms.get(hand, False)) for hand in ("left", "right")},
         )
 
 

@@ -28,8 +28,25 @@ class RollbackBuffer:
         return list(self.frames)[-n:]
 
     def execute(self, robot: RobotIO, frames: list[Frame]) -> None:
-        # Prefer absolute targets so rollback is independent of any lag between
-        # the robot's measured pose and its last command.
+        targets = [rollback_target16(frame) for frame in frames]
+        start_state = frame_start16(frames[0]) if frames else None
+        execute_waypoints = getattr(robot, "execute_rollback_waypoints", None)
+        if (
+            callable(execute_waypoints)
+            and start_state is not None
+            and targets
+            and all(target is not None for target in targets)
+        ):
+            reverse_targets = [target for target in reversed(targets[:-1])]
+            reverse_targets.append(start_state)
+            import numpy as np
+            execute_waypoints(
+                np.asarray(reverse_targets, np.float32),
+                step_duration_s=max(float(self.config.step_interval_s), 1e-3),
+            )
+            return
+
+        # Compatibility path for RobotIO implementations without waypoint support.
         for frame in reversed(frames[:-1]):
             target = rollback_target16(frame)
             if target is not None:
@@ -40,7 +57,6 @@ class RollbackBuffer:
                     robot.execute(delta_to_target(robot.state_action16(), target))
             if self.config.step_interval_s > 0:
                 time.sleep(self.config.step_interval_s)
-        start_state = rollback_target16(frames[0]) if frames else None
         if start_state is not None:
             execute_absolute = getattr(robot, "execute_absolute", None)
             if callable(execute_absolute):
@@ -58,6 +74,21 @@ def rollback_target16(frame: Frame):
     state = observation.get("_flowpro_rollback_target16")
     if state is None:
         state = observation.get("state_action16")
+    if state is None:
+        history = observation.get("wam4d", {}).get("observation.state", [])
+        if len(history):
+            state = history[-1]
+    if state is None:
+        return None
+    import numpy as np
+    return np.asarray(state, np.float32).reshape(16)
+
+
+def frame_start16(frame: Frame):
+    observation = frame.observation
+    if not isinstance(observation, dict):
+        return None
+    state = observation.get("state_action16")
     if state is None:
         history = observation.get("wam4d", {}).get("observation.state", [])
         if len(history):

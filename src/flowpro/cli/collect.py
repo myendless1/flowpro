@@ -52,7 +52,6 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--action-guidance-scale", type=float, default=1.0)
     p.add_argument("--takeover-max-translation-step-m", type=float, default=.01)
     p.add_argument("--takeover-max-rotation-step-deg", type=float, default=2.5)
-    p.add_argument("--sdk-frequency-hz", type=float, default=250)
     p.add_argument("--first-policy-waypoint-duration", type=float, default=.6)
     p.add_argument("--policy-waypoint-duration", type=float, default=.1)
     p.add_argument("--disable-policy-left-arm", action="store_true")
@@ -108,6 +107,56 @@ def _wait_for_enter(prompt: str, stopped) -> bool:
     return False
 
 
+def _wait_for_b_start(controls: QuestControlSource, stopped, period: float, episode: int) -> bool:
+    print(f"[Episode {episode}] Prepare the scene, then press B to start policy inference.", flush=True)
+    released = False
+    while not stopped():
+        started = time.monotonic()
+        control = controls.poll()
+        if not control.b:
+            released = True
+        elif released:
+            return True
+        time.sleep(max(0.0, period - (time.monotonic() - started)))
+    return False
+
+
+def _wait_for_chunk_decision(
+    controls: QuestControlSource,
+    stopped,
+    period: float,
+    *,
+    long_press_seconds: float = 2.0,
+) -> str:
+    print(
+        "Chunk complete: short press A=next chunk, hold A for 2s=finish episode, "
+        "B=rollback this chunk and enter takeover.",
+        flush=True,
+    )
+    buttons_released = False
+    previous_b = False
+    a_started: float | None = None
+    while not stopped():
+        started = time.monotonic()
+        control = controls.poll()
+        now = time.monotonic()
+        if not buttons_released:
+            buttons_released = not control.a and not control.b
+        else:
+            if control.b and not previous_b:
+                return "rollback"
+            if control.a:
+                if a_started is None:
+                    a_started = now
+                elif now - a_started >= long_press_seconds:
+                    return "finish"
+            elif a_started is not None:
+                return "continue"
+        previous_b = control.b
+        time.sleep(max(0.0, period - (time.monotonic() - started)))
+    return "stop"
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.fake:
@@ -120,7 +169,7 @@ def main() -> None:
 
     runtime = AstribotRuntimeConfig(
         sdk_root=args.sdk_root or AstribotRuntimeConfig.sdk_root,
-        sdk_frequency=args.sdk_frequency_hz,
+        sdk_frequency=args.takeover_rate_hz,
         init_joint_action=args.init_joint_action or AstribotRuntimeConfig().init_joint_action,
         reset_to_initial_on_startup=False,
         left_xyz_low=args.left_xyz_low, left_xyz_high=args.left_xyz_high,
@@ -157,7 +206,6 @@ def main() -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     period = 1.0 / max(args.control_rate_hz, 1e-6)
-    policy_period = 1.0 / max(args.policy_rate_hz, 1e-6)
     takeover_period = 1.0 / max(args.takeover_rate_hz, 1e-6)
     record_period = 1.0 / max(args.record_rate_hz, 1e-6)
     initial_pairs = sum(1 for path in PairStore(args.output).root.iterdir()
@@ -165,8 +213,8 @@ def main() -> None:
     committed = initial_pairs
     episode = 1
     print(
-        "Collector ready: Enter=reset/start gates, B=rollback, "
-        "hold middle=takeover, A=commit and stop episode, Ctrl-C=stop",
+        "Collector ready: Enter=reset, B=start/rollback, short A=next chunk, "
+        "hold A 2s=finish, middle=takeover, Ctrl-C=stop",
         flush=True,
     )
     try:
@@ -180,57 +228,68 @@ def main() -> None:
             robot.move_to_initial_pose()
             print(f"[Episode {episode}] Initial pose reached.", flush=True)
 
-            if not _wait_for_enter(
-                f"[Episode {episode}] Prepare the scene, then press Enter to start policy inference.",
-                lambda: stopped,
-            ):
-                break
             controls.reset()
             collector.start_episode()
-            print(
-                f"[Episode {episode}] Policy active: B=rollback, hold middle=takeover, "
-                "A=save and stop this episode.",
-                flush=True,
-            )
+            if not _wait_for_b_start(controls, lambda: stopped, period, episode):
+                break
 
-            # Quest is polled faster than the policy action stream. Only policy
-            # and takeover ticks issue commands, matching the SDK frequency.
-            next_policy = next_takeover = next_record = time.monotonic()
             episode_complete = False
+            pair_saved = False
             while not stopped and not episode_complete:
-                started = time.monotonic()
-                now = time.monotonic()
-                control = controls.poll()
-                command_due = (
-                    now >= next_policy
-                    if collector.phase is Phase.POLICY
-                    else now >= next_takeover
+                print(f"[Episode {episode}] Executing one policy action chunk...", flush=True)
+                collector.tick(InputState())
+                decision = _wait_for_chunk_decision(controls, lambda: stopped, period)
+                if decision == "stop":
+                    break
+                if decision == "continue":
+                    print(f"[Episode {episode}] A short press: continuing to the next chunk.", flush=True)
+                    continue
+                if decision == "finish":
+                    print(f"[Episode {episode}] A held for 2s: episode finished.", flush=True)
+                    episode_complete = True
+                    continue
+
+                print(f"[Episode {episode}] B pressed: rolling back the completed chunk.", flush=True)
+                collector.tick(InputState(b=True))
+                collector.tick(InputState())
+                print(
+                    f"[Episode {episode}] Takeover active: hold middle to control and record; "
+                    "press A to save and finish.",
+                    flush=True,
                 )
-                if collector.phase in (Phase.ROLLED_BACK, Phase.TAKEOVER):
+                next_takeover = next_record = time.monotonic()
+                while not stopped and not episode_complete:
+                    started = time.monotonic()
+                    now = time.monotonic()
+                    control = controls.poll()
                     control.record = now >= next_record
                     if control.record:
                         next_record = now + record_period
-                if command_due:
-                    previous_phase = collector.phase
-                    collector.tick(control)
-                    episode_complete = (
-                        control.a
-                        and previous_phase in (Phase.ROLLED_BACK, Phase.TAKEOVER)
-                        and collector.phase is Phase.POLICY
-                    )
-                    if collector.phase is Phase.POLICY:
-                        next_policy = now + policy_period
-                    else:
+                    if now >= next_takeover:
+                        previous_phase = collector.phase
+                        collector.tick(control)
+                        if (
+                            control.a
+                            and previous_phase in (Phase.ROLLED_BACK, Phase.TAKEOVER)
+                            and collector.phase is Phase.POLICY
+                        ):
+                            pair_saved = True
+                            episode_complete = True
                         next_takeover = now + takeover_period
-                time.sleep(max(0.0, period - (time.monotonic() - started)))
+                    time.sleep(max(0.0, period - (time.monotonic() - started)))
+
+                if pair_saved:
+                    print(f"[Episode {episode}] Takeover pair saved; episode finished.", flush=True)
+                if episode_complete:
+                    break
 
             if stopped:
                 break
-            committed += 1
-            print(f"[Episode {episode}] Pair saved; policy control stopped.", flush=True)
-            if args.target_pairs > 0 and committed - initial_pairs >= args.target_pairs:
-                print(f"Target reached: {args.target_pairs} new preference pairs", flush=True)
-                break
+            if pair_saved:
+                committed += 1
+                if args.target_pairs > 0 and committed - initial_pairs >= args.target_pairs:
+                    print(f"Target reached: {args.target_pairs} new preference pairs", flush=True)
+                    break
             episode += 1
     finally:
         # Re-issue the measured pose so a filtered Cartesian controller holds

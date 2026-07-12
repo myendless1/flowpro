@@ -8,6 +8,7 @@ from flowpro.collection.astribot_runtime import (
     AstribotRobotIO,
     AstribotRuntimeConfig,
     FakeAstribotRobotIO,
+    QuestControlSource,
     WanVAPolicy,
 )
 from wan_va.action_representation import (
@@ -89,6 +90,75 @@ def test_real_robot_adapter_submits_eef_and_grippers_in_one_mixed_command():
     assert kwargs == {"control_way": "filter", "use_wbc": False}
 
 
+def test_right_only_takeover_sends_a_fixed_left_target_in_complete_mixed_command():
+    class RecordingRobot:
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+        whole_body_names = [
+            "chassis", arm_left_name, effector_left_name, arm_right_name, effector_right_name
+        ]
+
+        def __init__(self): self.calls = []; self.arm_calls = []; self.gripper_calls = []
+        def set_different_type_command(self, names, types, commands, **kwargs):
+            self.calls.append((names, types, commands, kwargs))
+        def set_cartesian_pose(self, names, poses, **kwargs):
+            self.arm_calls.append((names, poses, kwargs))
+        def set_joints_position(self, names, positions, **kwargs):
+            self.gripper_calls.append((names, positions, kwargs))
+
+    initial = _pose16()
+    robot = AstribotRobotIO.__new__(AstribotRobotIO)
+    robot.config = AstribotRuntimeConfig(right_min_z=None)
+    robot.robot = RecordingRobot()
+    robot._last_target = initial.copy()
+    robot._takeover_limited_target = initial.copy()
+    robot.action_history = deque()
+    target = initial.copy(); target[8] += 0.005
+
+    robot.execute_takeover_absolute(
+        target, arm_command_mask={"left": False, "right": True}
+    )
+
+    assert len(robot.robot.calls) == 1
+    assert robot.robot.arm_calls == []
+    assert robot.robot.gripper_calls == []
+    names, types, commands, kwargs = robot.robot.calls[0]
+    assert names == ["left_arm", "left_gripper", "right_arm", "right_gripper"]
+    assert types == ["cartesian", "joints", "cartesian", "joints"]
+    np.testing.assert_allclose(commands[0][:3], initial[:3])
+    assert kwargs == {"control_way": "filter", "use_wbc": False}
+    np.testing.assert_allclose(robot.command_target16()[0:8], initial[0:8])
+
+
+def test_quest_rotation_does_not_modify_takeover_translation():
+    class Robot:
+        config = AstribotRuntimeConfig(right_min_z=None)
+
+    source = QuestControlSource.__new__(QuestControlSource)
+    source.robot = Robot()
+    source.anchor = _pose16()
+    source.anchor[8:11] = [0.4, -0.2, 0.9]
+    residual = np.zeros(14, np.float32)
+    info = {
+        "right": {
+            "active": True,
+            "relative_position": [0.0, 0.0, 0.0],
+            "scaled_rotvec": [0.3, -0.2, 0.1],
+        }
+    }
+
+    rotated = source._expert_action(residual, info)
+    np.testing.assert_allclose(rotated[8:11], source.anchor[8:11], atol=1e-7)
+
+    info["right"]["relative_position"] = [0.02, -0.01, 0.03]
+    translated = source._expert_action(residual, info)
+    np.testing.assert_allclose(
+        translated[8:11], source.anchor[8:11] + [0.02, -0.01, 0.03], atol=1e-7
+    )
+
+
 def test_real_robot_adapter_clamps_a_tiny_right_arm_min_z_undershoot():
     robot = AstribotRobotIO.__new__(AstribotRobotIO)
     robot.config = AstribotRuntimeConfig(right_min_z=0.862)
@@ -132,7 +202,7 @@ def test_takeover_rebases_command_gap_and_limits_each_streaming_step():
     robot.observation_history = deque()
     robot.state_action16 = lambda: measured.copy()
     sent = []
-    robot._send_target = lambda target: sent.append(np.asarray(target).copy())
+    robot._send_target = lambda target, **_kwargs: sent.append(np.asarray(target).copy())
 
     robot.begin_takeover()
     target = measured.copy(); target[8] = 0.08
@@ -140,6 +210,21 @@ def test_takeover_rebases_command_gap_and_limits_each_streaming_step():
 
     np.testing.assert_allclose(robot.command_target16()[8], 0.01, atol=1e-7)
     np.testing.assert_allclose(sent[-1][8], 0.01, atol=1e-7)
+
+
+def test_takeover_clamps_measured_right_z_below_safety_floor():
+    robot = AstribotRobotIO.__new__(AstribotRobotIO)
+    robot.config = AstribotRuntimeConfig(right_min_z=0.862)
+    measured = _pose16(); measured[10] = 0.8603
+    robot._last_target = measured.copy()
+    robot._takeover_limited_target = measured.copy()
+    robot.action_history = deque()
+    sent = []
+    robot._send_target = lambda target, **_kwargs: sent.append(np.asarray(target).copy())
+
+    robot.execute_takeover_absolute(measured)
+
+    assert sent[-1][10] >= 0.862
 
 
 def test_policy_delta_chunk_is_sent_as_one_absolute_waypoint_trajectory():

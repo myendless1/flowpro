@@ -9,7 +9,7 @@ import numpy as np
 from flowpro.data.types import Frame, TrajectoryPair
 from flowpro.data.store import PairStore
 from wan_va.action_representation import relative_pose7
-from .rollback import RollbackBuffer, RollbackConfig, rollback_target16
+from .rollback import RollbackBuffer, RollbackConfig, frame_start16
 from .protocol import Policy, RobotIO
 
 
@@ -26,6 +26,7 @@ class InputState:
     a: bool = False
     middle: float = 0.0
     expert_action: np.ndarray | None = None
+    active_arms: dict[str, bool] | None = None
     record: bool = True
 
 
@@ -74,7 +75,7 @@ class InterventionCollector:
             )
             self.phase = Phase.ARMED
             self.buffer.execute(self.robot, self._loser)
-            restored = rollback_target16(self._loser[0])
+            restored = frame_start16(self._loser[0])
             if hasattr(self.robot, "reset_history"):
                 self.robot.reset_history(
                     self._loser[0].action if restored is None else restored
@@ -97,7 +98,7 @@ class InterventionCollector:
                     self._winner_previous_observation = self.robot.observe()
                 execute_takeover = getattr(self.robot, "execute_takeover_absolute", None)
                 if callable(execute_takeover):
-                    execute_takeover(action)
+                    execute_takeover(action, arm_command_mask=controls.active_arms)
                 else:
                     execute_absolute = getattr(self.robot, "execute_absolute", None)
                     if callable(execute_absolute):

@@ -69,10 +69,10 @@ cd /home/xddex05/repo/flowpro
 真实机器人采集按 episode 门控执行：
 
 1. 终端提示后第一次按 Enter，机器人移动到配置的 `init_joint_action` 初始位姿。
-2. 整理任务场景，第二次按 Enter，策略才开始推理和下发动作。
-3. 推理过程中按 B 回退，按住 middle trigger 接管并录制修正轨迹。
-4. 按 A 保存偏好对并立即停止当前 episode 的策略控制。
-5. 下一轮再次按 Enter 复位；复位完成并整理好场景后，再按 Enter 开始推理。
+2. 整理任务场景，按 B 开始执行第一个策略 action chunk。
+3. 每个 chunk 完成后进入按键等待：短按 A 执行下一个 chunk，长按 A 至少 2 秒结束本轮，按 B 回退刚完成的 chunk 并进入接管。
+4. 接管状态下按住 middle trigger 控制机器人，并按 10Hz 记录实测 state delta 和图像；短按或长按 A 都会保存偏好对并结束本轮。
+5. 下一轮再次按 Enter 复位，然后按 B 开始推理。
 
 B 只回退当前 Wan-VA action chunk 中已经执行的动作，不再回退整个 episode。
 

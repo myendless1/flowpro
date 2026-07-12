@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from flowpro.collection import InputState, InterventionCollector, Phase
 from flowpro.collection.rollback import RollbackConfig
-from flowpro.data import PairStore
+from flowpro.data import Frame, PairStore
 from wan_va.action_representation import apply_relative_pose7
 
 
@@ -91,3 +91,28 @@ def test_winner_records_measured_state_delta_not_absolute_quest_target(tmp_path)
     pair = PairStore(tmp_path).load(next(tmp_path.iterdir()))
     np.testing.assert_allclose(pair.winner[-1].action[8], 0.02, atol=1e-6)
     assert abs(float(pair.winner[-1].action[8]) - float(target[8])) > 0.1
+
+
+def test_rollback_reverses_absolute_chunk_in_one_waypoint_call():
+    class WaypointRobot:
+        def __init__(self): self.calls = []
+        def execute_rollback_waypoints(self, targets, *, step_duration_s):
+            self.calls.append((np.asarray(targets).copy(), step_duration_s))
+
+    def pose(x):
+        value = np.zeros(16, np.float32); value[[3, 11]] = 1; value[8] = x
+        return value
+
+    frames = [
+        Frame({"state_action16": pose(i), "_flowpro_rollback_target16": pose(i + 1)}, pose(.01))
+        for i in range(3)
+    ]
+    robot = WaypointRobot()
+    from flowpro.collection.rollback import RollbackBuffer
+    buffer = RollbackBuffer(RollbackConfig(step_interval_s=.1))
+    buffer.execute(robot, frames)
+
+    assert len(robot.calls) == 1
+    targets, duration = robot.calls[0]
+    np.testing.assert_allclose(targets[:, 8], [2, 1, 0])
+    assert duration == pytest.approx(.1)
