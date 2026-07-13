@@ -8,13 +8,14 @@
   "paths": {
     "sft_dataset": "/media/damoxing/datasets/vae4d/lerobot-vae4d-org/astribot/centrifuge_multidrop-f1",
     "pretrain_save_dir": "outputs/pretrain",
-    "pretrained_transformer_dir": "outputs/pretrain/no4d-abl-delta-2500",
+    "pretrained_transformer_dir": "outputs/pretrain/no4d-abl-delta-3500",
     "rounds": "outputs/rounds",
     "manifests": "outputs/manifests"
   },
   "model": {
     "base_checkpoint": "outputs/base/robbyant/lingbot-va-base",
     "experiment_config": "src/wan_va/experiment_configs/delta.json",
+    "action_representation": "delta",
     "action_dim": 30,
     "execution_action_dim": 16
   },
@@ -29,6 +30,7 @@
     "host": "127.0.0.1",
     "port": 8006,
     "startup_timeout_seconds": 600,
+    "checkpoint_source": "auto",
     "state_history_len": 16,
     "action_num_inference_steps": 10
   },
@@ -47,6 +49,8 @@
     "record_rate_hz": 10,
     "takeover_max_translation_step_m": 0.01,
     "takeover_max_rotation_step_deg": 2.5,
+    "takeover_max_gripper_step": 0.02,
+    "gripper_trigger_threshold": 0.2,
     "first_policy_waypoint_duration": 0.6,
     "policy_waypoint_duration": 0.1,
     "obs_history_len": 1,

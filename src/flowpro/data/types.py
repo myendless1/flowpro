@@ -8,7 +8,7 @@ import numpy as np
 
 @dataclass
 class Frame:
-    """One robot tick; action is delta xyz + relative wxyz + absolute gripper."""
+    """One robot tick; stored actions use canonical delta EEF semantics."""
 
     observation: dict[str, Any]
     action: np.ndarray

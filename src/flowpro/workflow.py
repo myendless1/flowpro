@@ -62,9 +62,37 @@ def validate(cfg, round_id, dry_run, *, require_hardware: bool = False):
         raise RuntimeError("FlowPRO validation failed")
 
 
+def _has_transformer_checkpoint(path: Path) -> bool:
+    return (
+        (path / "config.json").is_file()
+        or (path / "transformer" / "config.json").is_file()
+        or (path / "checkpoints" / "last" / "transformer" / "config.json").is_file()
+    )
+
+
+def _inference_checkpoint(cfg: ProjectConfig, round_id: int) -> Path:
+    pretrained = cfg.path_for("paths.pretrained_transformer_dir")
+    mode = str(cfg.section("inference").get("checkpoint_source", "auto"))
+    if mode not in {"auto", "pretrained", "previous_round"}:
+        raise ValueError(
+            "inference.checkpoint_source must be auto, pretrained, or previous_round"
+        )
+    if round_id <= 1 or mode == "pretrained":
+        return pretrained
+    previous = cfg.round_dir(round_id - 1) / "offline_rl"
+    if mode == "previous_round" or _has_transformer_checkpoint(previous):
+        return previous
+    print(
+        f"WARNING: previous-round checkpoint not found at {previous}; "
+        f"using pretrained transformer {pretrained}",
+        flush=True,
+    )
+    return pretrained
+
+
 def infer(cfg, round_id, dry_run):
     rid=round_id or 1; s=cfg.section("inference"); out=cfg.round_dir(rid,create=not dry_run)/"inference"
-    checkpoint=cfg.path_for("paths.pretrained_transformer_dir") if rid == 1 else cfg.round_dir(rid-1)/"offline_rl"
+    checkpoint=_inference_checkpoint(cfg,rid)
     cmd=[sys.executable,"-m","wan_va.wan_va_server","--config-name",s["config_name"],"--experiment-config",str(cfg.path_for("model.experiment_config")),
          "--port",str(s["port"]),"--transformer-source",str(checkpoint),
          "--pretrained-model-path",str(cfg.path_for("model.base_checkpoint")),"--state-history-len",str(s["state_history_len"]),
@@ -87,8 +115,11 @@ def collect(cfg, round_id, dry_run):
          "--obs-history-len",str(s.get("obs_history_len",9)),
          "--video-guidance-scale",str(s.get("video_guidance_scale",1)),
          "--action-guidance-scale",str(s.get("action_guidance_scale",1)),
+         "--action-representation",str(cfg.section("model").get("action_representation","delta")),
          "--takeover-max-translation-step-m",str(s.get("takeover_max_translation_step_m",0.01)),
          "--takeover-max-rotation-step-deg",str(s.get("takeover_max_rotation_step_deg",2.5)),
+         "--takeover-max-gripper-step",str(s.get("takeover_max_gripper_step",0.02)),
+         "--gripper-trigger-threshold",str(s.get("gripper_trigger_threshold",0.2)),
          "--first-policy-waypoint-duration",str(s.get("first_policy_waypoint_duration",0.6)),
          "--policy-waypoint-duration",str(s.get("policy_waypoint_duration",0.1))]
     if int(s.get("target_pairs",0)) > 0:
@@ -128,7 +159,7 @@ STAGES={"validate":validate,"pretrain":pretrain,"infer":infer,"collect":collect,
 def inference_collect(cfg: ProjectConfig, round_id: int, dry_run: bool):
     if dry_run:
         infer(cfg, round_id, True); collect(cfg, round_id, True); return
-    s=cfg.section("inference"); checkpoint=cfg.path_for("paths.pretrained_transformer_dir") if round_id == 1 else cfg.round_dir(round_id-1)/"offline_rl"
+    s=cfg.section("inference"); checkpoint=_inference_checkpoint(cfg,round_id)
     server=[sys.executable,"-m","wan_va.wan_va_server","--config-name",s["config_name"],"--experiment-config",str(cfg.path_for("model.experiment_config")),
             "--port",str(s["port"]),"--transformer-source",str(checkpoint),
             "--pretrained-model-path",str(cfg.path_for("model.base_checkpoint")),"--state-history-len",str(s["state_history_len"]),

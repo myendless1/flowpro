@@ -27,8 +27,9 @@ from dataset.curation.base import resolve_lerobot_videos_root
 from dataset.clip_latent_cache import clip_latent_paths_for_sample
 from action_representation import (
     EXECUTION_CHANNEL_IDS,
-    delta16_to_model30,
-    absolute_history_to_delta,
+    encode_absolute_history,
+    encode_action_targets,
+    validate_action_representation,
 )
 
 def recursive_find_file(directory, filename='info.json'):
@@ -219,6 +220,12 @@ class LatentLeRobotDataset(LeRobotDataset):
         logger.info(f"Use action loss: {self.enable_action_loss}: Dataset {repo_id}")
         self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
         self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
+        state_norm_stat = getattr(config, "state_norm_stat", config.norm_stat)
+        self.state_q01 = np.array(state_norm_stat['q01'], dtype='float')[None]
+        self.state_q99 = np.array(state_norm_stat['q99'], dtype='float')[None]
+        self.action_representation = validate_action_representation(
+            getattr(config, "action_representation", "absolute")
+        )
         self.release_pose_aux = bool(getattr(config, "release_pose_aux", False))
         self.release_open_threshold = float(
             getattr(config, "release_open_threshold", 0.5)
@@ -1019,7 +1026,7 @@ class LatentLeRobotDataset(LeRobotDataset):
 
         return self._format_state_history(history, valid_count, history_dim)
 
-    def _normalize_model_actions(self, values):
+    def _normalize_model_actions(self, values, *, q01=None, q99=None):
         if torch.is_tensor(values):
             values = values.detach().cpu().numpy()
         values = np.asarray(values, dtype=np.float32)
@@ -1032,8 +1039,10 @@ class LatentLeRobotDataset(LeRobotDataset):
             raise ValueError(
                 f"Expected model actions [T,{self.config.action_dim}], got {values.shape}"
             )
+        q01 = self.q01 if q01 is None else q01
+        q99 = self.q99 if q99 is None else q99
         values = (
-            (values - self.q01) / (self.q99 - self.q01 + 1e-6) * 2.0
+            (values - q01) / (q99 - q01 + 1e-6) * 2.0
             - 1.0
         )
         return np.clip(values, -1.5, 1.5)
@@ -1043,12 +1052,10 @@ class LatentLeRobotDataset(LeRobotDataset):
         valid_mask = np.asarray(state_mask, dtype=bool)
         represented = np.zeros((state_action.shape[0], self.config.action_dim), dtype=np.float32)
         if valid_mask.any():
-            valid_history = absolute_history_to_delta(state_action[valid_mask])
-            # History is already delta-encoded; only place it in model channels.
-            valid_model = np.zeros((valid_history.shape[0], self.config.action_dim), dtype=np.float32)
-            valid_model[:, EXECUTION_CHANNEL_IDS] = valid_history
-            represented[valid_mask] = valid_model
-        state_aligned = self._normalize_model_actions(represented)
+            represented[valid_mask] = encode_absolute_history(state_action[valid_mask])
+        state_aligned = self._normalize_model_actions(
+            represented, q01=self.state_q01, q99=self.state_q99
+        )
         state_aligned *= self.state_channel_mask
         return torch.from_numpy(state_aligned.T[:, :, None, None]).float()
 
@@ -1069,8 +1076,9 @@ class LatentLeRobotDataset(LeRobotDataset):
             )
         if torch.is_tensor(references):
             references = references.detach().cpu().numpy()
-        model_action, action_mask_aligned = delta16_to_model30(
+        model_action, action_mask_aligned = encode_action_targets(
             action,
+            representation=self.action_representation,
             references=np.asarray(references, dtype=np.float32),
             release_poses=release_poses,
             release_references=np.asarray(references, dtype=np.float32),

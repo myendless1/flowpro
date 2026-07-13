@@ -23,7 +23,13 @@ def main():
             (out/f"{pair_dir.name}-{i:05d}.json").write_text(json.dumps({"source":sample.source,"pair_id":sample.pair_id,
                 "observation":observation},default=lambda x:x.tolist() if isinstance(x,np.ndarray) else str(x)))
             count+=1
-    (out/"manifest.json").write_text(json.dumps({"round":a.round,"samples":count,"config":str(cfg.path)},indent=2))
+    (out/"manifest.json").write_text(json.dumps({
+        "round": a.round,
+        "samples": count,
+        "config": str(cfg.path),
+        "action_representation": cfg.section("model").get("action_representation", "delta"),
+        "history_action_representation": "absolute",
+    }, indent=2))
     print(f"wrote {count} preference samples to {out}")
 
 if __name__=="__main__": main()

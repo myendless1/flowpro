@@ -79,13 +79,13 @@ flowpro_config_value() {
     local config_path=${2:-${FLOWPRO_CONFIG_DEFAULT}}
     local python=${3:-${FLOWPRO_TRAIN_PYTHON_DEFAULT}}
     flowpro_require_file "${python}"
+    PYTHONPATH="${FLOWPRO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
     "${python}" - "${config_path}" "${dotted_key}" <<'PY'
-import json
 import sys
+from flowpro.config import load_config
 
 config_path, dotted_key = sys.argv[1:]
-with open(config_path, encoding="utf-8") as fh:
-    value = json.load(fh)
+value = load_config(config_path).data
 for part in dotted_key.split("."):
     value = value[part]
 print(value)

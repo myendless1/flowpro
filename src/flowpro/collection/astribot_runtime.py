@@ -13,7 +13,10 @@ from typing import Any
 
 import numpy as np
 
-from astribot_env.quest_intervention import QuestResidualIntervention
+from astribot_env.quest_intervention import (
+    QuestResidualIntervention,
+    index_trigger_to_gripper_action,
+)
 from astribot_env.initial_pose import default_init_joint_action, normalize_init_joint_action
 from astribot_env.rgbd import RGBDReader, build_wam4d_observation_payload, get_current_eef_state
 from astribot_env.sdk_loader import DEFAULT_ASTRIBOT_SDK_ROOT, load_astribot_class
@@ -27,13 +30,18 @@ from astribot_env.utils import (
     sdk_xyzw_to_action_quat,
 )
 from astribot_env.wam4d_policy import WAM4DPriorClient
-from wan_va.action_representation import apply_relative_pose7, relative_pose7
+from wan_va.action_representation import (
+    apply_relative_pose7,
+    relative_pose7,
+    validate_action_representation,
+)
 
 from .controller import InputState
 
 
 @dataclass
 class AstribotRuntimeConfig:
+    action_representation: str = "delta"
     sdk_root: str = ""
     robot_type: str = "S1"
     sdk_frequency: float = 100.0
@@ -46,6 +54,7 @@ class AstribotRuntimeConfig:
     max_rotation_step_deg: float = 15.0
     takeover_max_translation_step_m: float = 0.01
     takeover_max_rotation_step_deg: float = 2.5
+    takeover_max_gripper_step: float = 0.02
     first_policy_waypoint_duration: float = 0.6
     policy_waypoint_duration: float = 0.1
     init_joint_action: list[list[float]] = field(default_factory=default_init_joint_action)
@@ -61,12 +70,15 @@ class AstribotRuntimeConfig:
 
 
 class AstribotRobotIO:
-    """Delta-EEF adapter following Astribot's online Cartesian-control example."""
+    """Astribot adapter with configurable policy action semantics."""
 
     def __init__(self, config: AstribotRuntimeConfig | None = None) -> None:
         import os
 
         self.config = config or AstribotRuntimeConfig()
+        self.action_representation = validate_action_representation(
+            self.config.action_representation
+        )
         os.environ.setdefault("ROBOT_TYPE", self.config.robot_type)
         Astribot = load_astribot_class(self.config.sdk_root)
         self.robot = Astribot(freq=self.config.sdk_frequency, high_control_rights=True)
@@ -82,7 +94,7 @@ class AstribotRobotIO:
         self.action_history: deque[np.ndarray] = deque(maxlen=self.config.state_history_len)
         self.observation_history: deque[dict[str, Any]] = deque(maxlen=self.config.obs_history_len)
         # Delta policy actions are integrated against the target actually sent
-        # to the SDK, not noisy/lagged measured Cartesian feedback.
+        # to the SDK. Both modes expose those absolute cmd targets as history.
         self._last_target = self.state_action16()
         self._takeover_limited_target: np.ndarray | None = None
         self._policy_chunk_count = 0
@@ -109,6 +121,15 @@ class AstribotRobotIO:
 
     def command_target16(self) -> np.ndarray:
         return self._last_target.copy()
+
+    def _configured_action_representation(self) -> str:
+        return validate_action_representation(
+            getattr(
+                self,
+                "action_representation",
+                getattr(self.config, "action_representation", "delta"),
+            )
+        )
 
     def begin_takeover(self) -> None:
         """Rebase teleoperation on measured state without treating servo lag as motion."""
@@ -161,7 +182,7 @@ class AstribotRobotIO:
             target[off : off + 7] = apply_relative_pose7(
                 reference[off : off + 7], delta[off : off + 7]
             )
-            target[off + 7] = delta[off + 7]
+            target[off + 7] = np.clip(delta[off + 7], 0.0, 1.0)
             if low is not None:
                 target[off : off + 3] = np.maximum(
                     target[off : off + 3], np.asarray(low, dtype=np.float32)
@@ -200,9 +221,9 @@ class AstribotRobotIO:
         active = arm_command_mask or {"left": True, "right": True}
         grip_indices = [7 if hand == "left" else 15 for hand in ("left", "right") if active.get(hand, False)]
         if grip_indices and (
-            np.any(delta[grip_indices] < 0) or np.any(delta[grip_indices] > 1)
+            np.any(target[grip_indices] < 0) or np.any(target[grip_indices] > 1)
         ):
-            raise ValueError(f"Gripper targets must be in [0,1], got {delta[grip_indices]}")
+            raise ValueError(f"Gripper targets must be in [0,1], got {target[grip_indices]}")
         for hand, off, low, high in (
             ("left", 0, self.config.left_xyz_low, self.config.left_xyz_high),
             ("right", 8, self.config.right_xyz_low, self.config.right_xyz_high),
@@ -287,24 +308,42 @@ class AstribotRobotIO:
         )
 
     def execute(self, action16: np.ndarray) -> None:
-        delta = np.asarray(action16, dtype=np.float32).reshape(ACTION16_DIM)
-        if not np.isfinite(delta).all():
+        action = np.asarray(action16, dtype=np.float32).reshape(ACTION16_DIM)
+        if not np.isfinite(action).all():
             raise ValueError("Robot command contains NaN/Inf")
-        target = self._delta_to_target(delta)
+        reference = getattr(self, "_last_target", None)
+        if reference is None:
+            reference = self.state_action16()
+        reference = np.asarray(reference, np.float32).reshape(ACTION16_DIM).copy()
+        if self._configured_action_representation() == "delta":
+            target = self._delta_to_target(action, reference=reference)
+        else:
+            target = self._delta_to_target(
+                self._absolute_to_delta(reference, action), reference=reference
+            )
+        delta = self._absolute_to_delta(reference, target)
         self._validate_step(delta, target)
         self._send_target(target)
         self._last_target = target.copy()
         self.action_history.append(target.copy())
 
     def execute_policy_waypoints(self, actions16: np.ndarray) -> np.ndarray:
-        """Decode one delta chunk and submit it as one continuous SDK trajectory."""
-        deltas = np.asarray(actions16, np.float32).reshape(-1, ACTION16_DIM)
-        if not len(deltas):
+        """Decode one policy chunk and submit absolute SDK waypoints."""
+        actions = np.asarray(actions16, np.float32).reshape(-1, ACTION16_DIM)
+        if not len(actions):
             raise ValueError("Policy waypoint chunk cannot be empty")
         reference = self._last_target.copy()
         targets = []
-        for delta in deltas:
-            target = self._delta_to_target(delta, reference=reference)
+        for action in actions:
+            if not np.isfinite(action).all():
+                raise ValueError("Robot command contains NaN/Inf")
+            if self._configured_action_representation() == "delta":
+                target = self._delta_to_target(action, reference=reference)
+            else:
+                target = self._delta_to_target(
+                    self._absolute_to_delta(reference, action), reference=reference
+                )
+            delta = self._absolute_to_delta(reference, target)
             self._validate_step(delta, target)
             targets.append(target)
             reference = target
@@ -456,11 +495,18 @@ class AstribotRobotIO:
                     target[off + 3 : off + 7],
                     max_rotation / angle,
                 )
+            max_gripper = float(self.config.takeover_max_gripper_step)
+            if max_gripper > 0.0:
+                gripper_delta = float(target[off + 7] - previous[off + 7])
+                limited[off + 7] = previous[off + 7] + np.clip(
+                    gripper_delta, -max_gripper, max_gripper
+                )
         if active.get("right", False) and self.config.right_min_z is not None:
             minimum_z = np.float32(self.config.right_min_z)
             limited[10] = max(
                 limited[10], np.nextafter(minimum_z, np.float32(np.inf))
             )
+        limited[[7, 15]] = np.clip(limited[[7, 15]], 0.0, 1.0)
         delta = self._absolute_to_delta(previous, limited)
         self._validate_step(delta, limited, arm_command_mask=active)
         # Submit a complete mixed command so the SDK receives one atomic
@@ -484,15 +530,18 @@ class WanVAPolicy:
     def __init__(self, *, host: str, port: int, prompt: str, state_history_len: int = 16,
                  obs_history_len: int = 9, replan_steps: int = 8, fake: bool = False,
                  control_left_arm: bool = True, video_guidance_scale: float = 1.0,
-                 action_guidance_scale: float = 1.0) -> None:
+                 action_guidance_scale: float = 1.0,
+                 action_representation: str = "delta") -> None:
         self.prompt = prompt
         self.replan_steps = int(replan_steps)
         self.control_left_arm = bool(control_left_arm)
+        self.action_representation = validate_action_representation(action_representation)
         self.client = WAM4DPriorClient(
             host=host, port=port, prompt=prompt, state_history_len=state_history_len,
             obs_history_len=obs_history_len,
             video_guidance_scale=video_guidance_scale,
             action_guidance_scale=action_guidance_scale,
+            action_representation=self.action_representation,
             fake=fake,
         )
         self._executed_server_action_count = 0
@@ -507,33 +556,43 @@ class WanVAPolicy:
         self,
         action16: np.ndarray,
         *,
-        current_state16: np.ndarray | None,
+        current_command16: np.ndarray | None,
     ) -> np.ndarray:
-        """Log the server's de-normalized delta action immediately before use."""
+        """Log the server's de-normalized action immediately before use."""
         action = np.asarray(action16, dtype=np.float32).reshape(ACTION16_DIM)
         self._executed_server_action_count += 1
         left_xyz = action[0:3]
         right_xyz = action[8:11]
         print(
             "WAM4D server action "
-            f"#{self._executed_server_action_count} (de-normalized delta xyz): "
+            f"#{self._executed_server_action_count} "
+            f"(de-normalized {self.action_representation} xyz): "
             f"left=[{left_xyz[0]:+.5f}, {left_xyz[1]:+.5f}, {left_xyz[2]:+.5f}] "
             f"right=[{right_xyz[0]:+.5f}, {right_xyz[1]:+.5f}, {right_xyz[2]:+.5f}]",
             flush=True,
         )
         if not self.control_left_arm:
             action = action.copy()
-            action[0:3] = 0.0
-            action[3:7] = [1.0, 0.0, 0.0, 0.0]
-            if current_state16 is not None:
-                action[7] = np.asarray(current_state16, dtype=np.float32).reshape(ACTION16_DIM)[7]
+            current = None
+            if current_command16 is not None:
+                current = np.asarray(current_command16, dtype=np.float32).reshape(ACTION16_DIM)
+            if self.action_representation == "delta":
+                action[0:3] = 0.0
+                action[3:7] = [1.0, 0.0, 0.0, 0.0]
+                if current is not None:
+                    action[7] = current[7]
+            elif current is not None:
+                action[0:8] = current[0:8]
             print("WAM4D policy: left arm/gripper locked; executing right arm only.", flush=True)
         return action
 
     def infer(self, observation: dict[str, Any]) -> np.ndarray:
-        current_state16 = observation.get("state_action16")
+        current_command16 = observation.get("state_action16")
         self.last_inference_started_chunk = True
         payload = dict(observation["wam4d"])
+        executed_history = payload.get("observation.executed_action_history")
+        if executed_history is not None and len(executed_history):
+            current_command16 = np.asarray(executed_history, np.float32)[-1]
         payload["task"] = self.prompt
         chunk = self.client.infer_prior_chunk(
             payload,
@@ -541,7 +600,7 @@ class WanVAPolicy:
             max_steps=self.replan_steps,
         )
         return np.stack([
-            self._action_for_execution(action, current_state16=current_state16)
+            self._action_for_execution(action, current_command16=current_command16)
             for action in np.asarray(chunk, np.float32).reshape(-1, ACTION16_DIM)
         ])
 
@@ -551,11 +610,12 @@ class QuestControlSource:
 
     def __init__(self, robot: AstribotRobotIO, *, state_url: str,
                  trigger_threshold: float = 0.5, button_a_index: int = 4,
-                 button_b_index: int = 5) -> None:
+                 button_b_index: int = 5,
+                 gripper_trigger_threshold: float = 0.2) -> None:
         self.robot = robot
         self.quest = QuestResidualIntervention(
             state_url=state_url, trigger_threshold=trigger_threshold,
-            gripper_threshold=0.2, position_scale=1.0,
+            gripper_threshold=gripper_trigger_threshold, position_scale=1.0,
             residual_position_scale=0.2, residual_rotation_scale=np.deg2rad(30),
             episode_button_hand="right", success_button_index=button_a_index,
             failure_button_index=button_b_index, episode_button_threshold=0.5,
@@ -582,8 +642,10 @@ class QuestControlSource:
             base_q = action_quat_to_sdk_xyzw(self.anchor[off+3:off+7], use_xyzw=self.robot.config.use_xyzw)
             target_q = quat_multiply_xyzw(base_q, rotvec_to_quat_xyzw(delta_rot))
             target[off+3:off+7] = sdk_xyzw_to_action_quat(target_q, use_xyzw=self.robot.config.use_xyzw)
-            grip = float(residual[roff + 6])
-            target[off+7] = 1.0 if grip <= -.5 else (0.0 if grip >= .5 else target[off+7])
+            if "index" in hand_info:
+                target[off + 7] = index_trigger_to_gripper_action(
+                    float(hand_info["index"]), self.quest.gripper_threshold
+                )
         return target.astype(np.float32)
 
     def poll(self) -> InputState:
@@ -617,7 +679,8 @@ class QuestControlSource:
 class FakeAstribotRobotIO:
     """Deterministic adapter for deployment smoke tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, action_representation: str = "delta") -> None:
+        self.action_representation = validate_action_representation(action_representation)
         self.action = np.zeros(16, np.float32)
         self.action[[3, 11]] = 1
         self.step = 0
@@ -636,11 +699,15 @@ class FakeAstribotRobotIO:
             "observation.images.cam_left_wrist": image,
             "observation.images.cam_right_wrist": image,
             "observation.state": np.asarray([self.action]),
+            "observation.executed_action_history": np.asarray([self.action]),
             "task": "fake",
         }
         return {"state_action16": self.action.copy(), "wam4d": payload, "step": self.step}
 
     def execute(self, action16: np.ndarray) -> None:
+        if self.action_representation == "absolute":
+            self.execute_absolute(action16)
+            return
         delta = np.asarray(action16, np.float32).reshape(16)
         target = self.action.copy()
         target[0:7] = apply_relative_pose7(self.action[0:7], delta[0:7])

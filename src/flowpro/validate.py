@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import json
 from pathlib import Path
 import os
 
@@ -17,10 +18,39 @@ class Check:
     detail: str
 
 
+def _experiment_action_representation(path: Path) -> str | None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    parent = payload.get("base_experiment")
+    if "action_representation" in payload:
+        return str(payload["action_representation"])
+    if parent:
+        return _experiment_action_representation(path.parent / str(parent))
+    return None
+
+
 def validate_project(cfg: ProjectConfig, *, require_hardware: bool = False) -> list[Check]:
     checks: list[Check] = []
     collection = cfg.section("collection")
     augmentation = cfg.section("augmentation")
+    action_representation = str(
+        cfg.section("model").get("action_representation", "delta")
+    )
+    checks.append(Check(
+        "action_representation",
+        action_representation in {"absolute", "delta"},
+        action_representation,
+    ))
+    experiment_path = cfg.path_for("model.experiment_config")
+    try:
+        experiment_representation = _experiment_action_representation(experiment_path)
+    except (OSError, ValueError, TypeError) as exc:
+        checks.append(Check("experiment_representation", False, str(exc)))
+    else:
+        checks.append(Check(
+            "experiment_representation",
+            experiment_representation == action_representation,
+            f"project={action_representation}, experiment={experiment_representation}",
+        ))
     horizon = int(augmentation["horizon"])
     rollback = int(collection["rollback_horizon"])
     capacity = int(collection["rollback_capacity"])

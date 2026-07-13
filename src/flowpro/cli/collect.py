@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import select
 import signal
-import sys
 import time
 
 import numpy as np
@@ -50,8 +48,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--obs-history-len", type=int, default=9)
     p.add_argument("--video-guidance-scale", type=float, default=1.0)
     p.add_argument("--action-guidance-scale", type=float, default=1.0)
+    p.add_argument("--action-representation", choices=("absolute", "delta"), default="delta")
     p.add_argument("--takeover-max-translation-step-m", type=float, default=.01)
     p.add_argument("--takeover-max-rotation-step-deg", type=float, default=2.5)
+    p.add_argument("--takeover-max-gripper-step", type=float, default=.02)
+    p.add_argument("--gripper-trigger-threshold", type=float, default=.2)
     p.add_argument("--first-policy-waypoint-duration", type=float, default=.6)
     p.add_argument("--policy-waypoint-duration", type=float, default=.1)
     p.add_argument("--disable-policy-left-arm", action="store_true")
@@ -74,9 +75,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _run_fake(args: argparse.Namespace) -> int:
-    robot = FakeAstribotRobotIO()
+    robot = FakeAstribotRobotIO(args.action_representation)
     policy = WanVAPolicy(host=args.host, port=args.port, prompt=args.prompt,
-                         replan_steps=args.replan_steps, fake=True)
+                         replan_steps=args.replan_steps, fake=True,
+                         action_representation=args.action_representation)
     collector = InterventionCollector(
         robot, policy, PairStore(args.output), round_id=args.round,
         rollback=RollbackConfig(args.rollback_capacity, args.rollback_horizon, 0.0),
@@ -93,27 +95,35 @@ def _run_fake(args: argparse.Namespace) -> int:
     return args.fake_pairs
 
 
-def _wait_for_enter(prompt: str, stopped) -> bool:
-    if not sys.stdin.isatty():
-        raise RuntimeError("interactive episode collection requires a terminal on stdin")
-    print(prompt, flush=True)
-    while not stopped():
-        ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-        if not ready:
-            continue
-        if sys.stdin.readline() == "":
-            return False
-        return True
-    return False
-
-
-def _wait_for_b_start(controls: QuestControlSource, stopped, period: float, episode: int) -> bool:
-    print(f"[Episode {episode}] Prepare the scene, then press B to start policy inference.", flush=True)
+def _wait_for_a_reset(
+    controls: QuestControlSource,
+    stopped,
+    period: float,
+    episode: int,
+) -> bool:
+    print(
+        f"[Episode {episode}] Press A to move the robot to the initial pose.",
+        flush=True,
+    )
     released = False
     while not stopped():
         started = time.monotonic()
         control = controls.poll()
-        if not control.b:
+        if not control.a:
+            released = True
+        elif released:
+            return True
+        time.sleep(max(0.0, period - (time.monotonic() - started)))
+    return False
+
+
+def _wait_for_a_start(controls: QuestControlSource, stopped, period: float, episode: int) -> bool:
+    print(f"[Episode {episode}] Prepare the scene, then press A to start policy inference.", flush=True)
+    released = False
+    while not stopped():
+        started = time.monotonic()
+        control = controls.poll()
+        if not control.a:
             released = True
         elif released:
             return True
@@ -157,6 +167,16 @@ def _wait_for_chunk_decision(
     return "stop"
 
 
+def _gate_takeover_retry_b(control: InputState, armed: bool) -> bool:
+    """Ignore the rollback-triggering B hold until it has been released."""
+    if armed:
+        return True
+    if not control.b:
+        return True
+    control.b = False
+    return False
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.fake:
@@ -168,6 +188,7 @@ def main() -> None:
         raise SystemExit("--prompt must describe the real robot task")
 
     runtime = AstribotRuntimeConfig(
+        action_representation=args.action_representation,
         sdk_root=args.sdk_root or AstribotRuntimeConfig.sdk_root,
         sdk_frequency=args.takeover_rate_hz,
         init_joint_action=args.init_joint_action or AstribotRuntimeConfig().init_joint_action,
@@ -177,6 +198,7 @@ def main() -> None:
         right_min_z=args.right_min_z,
         takeover_max_translation_step_m=args.takeover_max_translation_step_m,
         takeover_max_rotation_step_deg=args.takeover_max_rotation_step_deg,
+        takeover_max_gripper_step=args.takeover_max_gripper_step,
         first_policy_waypoint_duration=args.first_policy_waypoint_duration,
         policy_waypoint_duration=args.policy_waypoint_duration,
         state_history_len=args.state_history_len,
@@ -188,9 +210,14 @@ def main() -> None:
                          obs_history_len=args.obs_history_len,
                          control_left_arm=not args.disable_policy_left_arm,
                          video_guidance_scale=args.video_guidance_scale,
-                         action_guidance_scale=args.action_guidance_scale)
-    controls = QuestControlSource(robot, state_url=args.quest_state_url,
-                                  trigger_threshold=args.trigger_threshold)
+                         action_guidance_scale=args.action_guidance_scale,
+                         action_representation=args.action_representation)
+    controls = QuestControlSource(
+        robot,
+        state_url=args.quest_state_url,
+        trigger_threshold=args.trigger_threshold,
+        gripper_trigger_threshold=args.gripper_trigger_threshold,
+    )
     collector = InterventionCollector(
         robot, policy, PairStore(args.output), round_id=args.round,
         rollback=RollbackConfig(args.rollback_capacity, args.rollback_horizon,
@@ -213,15 +240,15 @@ def main() -> None:
     committed = initial_pairs
     episode = 1
     print(
-        "Collector ready: Enter=reset, B=start/rollback, short A=next chunk, "
+        "Collector ready: A=reset/start/next/finish, B=rollback/retry, "
         "hold A 2s=finish, middle=takeover, Ctrl-C=stop",
         flush=True,
     )
     try:
         while not stopped:
-            if not _wait_for_enter(
-                f"[Episode {episode}] Press Enter to move the robot to the initial pose.",
-                lambda: stopped,
+            controls.reset()
+            if not _wait_for_a_reset(
+                controls, lambda: stopped, period, episode
             ):
                 break
             print(f"[Episode {episode}] Moving to the initial pose...", flush=True)
@@ -230,11 +257,12 @@ def main() -> None:
 
             controls.reset()
             collector.start_episode()
-            if not _wait_for_b_start(controls, lambda: stopped, period, episode):
+            if not _wait_for_a_start(controls, lambda: stopped, period, episode):
                 break
 
             episode_complete = False
             pair_saved = False
+            retry_episode = False
             while not stopped and not episode_complete:
                 print(f"[Episode {episode}] Executing one policy action chunk...", flush=True)
                 collector.tick(InputState())
@@ -254,14 +282,16 @@ def main() -> None:
                 collector.tick(InputState())
                 print(
                     f"[Episode {episode}] Takeover active: hold middle to control and record; "
-                    "press A to save and finish.",
+                    "press A to save and finish; press B to discard and retry.",
                     flush=True,
                 )
                 next_takeover = next_record = time.monotonic()
+                retry_b_armed = False
                 while not stopped and not episode_complete:
                     started = time.monotonic()
                     now = time.monotonic()
                     control = controls.poll()
+                    retry_b_armed = _gate_takeover_retry_b(control, retry_b_armed)
                     control.record = now >= next_record
                     if control.record:
                         next_record = now + record_period
@@ -269,22 +299,43 @@ def main() -> None:
                         previous_phase = collector.phase
                         collector.tick(control)
                         if (
+                            control.b
+                            and previous_phase in (Phase.ROLLED_BACK, Phase.TAKEOVER)
+                            and collector.phase is Phase.POLICY
+                        ):
+                            retry_episode = bool(
+                                getattr(collector, "last_pair_discarded", False)
+                            )
+                            episode_complete = True
+                        elif (
                             control.a
                             and previous_phase in (Phase.ROLLED_BACK, Phase.TAKEOVER)
                             and collector.phase is Phase.POLICY
                         ):
-                            pair_saved = True
+                            pair_saved = bool(getattr(collector, "last_pair_saved", False))
                             episode_complete = True
                         next_takeover = now + takeover_period
                     time.sleep(max(0.0, period - (time.monotonic() - started)))
 
-                if pair_saved:
+                if retry_episode:
+                    print(
+                        f"[Episode {episode}] Pair discarded; restarting this episode.",
+                        flush=True,
+                    )
+                elif pair_saved:
                     print(f"[Episode {episode}] Takeover pair saved; episode finished.", flush=True)
+                elif episode_complete:
+                    print(
+                        f"[Episode {episode}] No correction recorded; episode finished without saving a pair.",
+                        flush=True,
+                    )
                 if episode_complete:
                     break
 
             if stopped:
                 break
+            if retry_episode:
+                continue
             if pair_saved:
                 committed += 1
                 if args.target_pairs > 0 and committed - initial_pairs >= args.target_pairs:
@@ -297,10 +348,7 @@ def main() -> None:
         # check aborts collection.
         try:
             state = robot.state_action16()
-            hold_delta = np.zeros((16,), dtype=np.float32)
-            hold_delta[[3, 11]] = 1.0
-            hold_delta[[7, 15]] = state[[7, 15]]
-            robot.execute(hold_delta)
+            robot.execute_absolute(state)
         except Exception as exc:
             print(f"WARNING: failed to send final hold command: {exc}", flush=True)
 

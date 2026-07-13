@@ -1,8 +1,11 @@
 import json
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+
+from astribot_env.quest_intervention import index_trigger_to_gripper_action
 
 from flowpro.collection.astribot_runtime import (
     AstribotRobotIO,
@@ -13,8 +16,11 @@ from flowpro.collection.astribot_runtime import (
 )
 from wan_va.action_representation import (
     EXECUTION_CHANNEL_IDS,
+    decode_action_sequence,
     decode_execution_sequence,
     delta16_to_model30,
+    encode_absolute_history,
+    encode_action_targets,
     model30_to_execution16,
 )
 
@@ -48,6 +54,48 @@ def test_fake_robot_applies_each_delta_against_live_state():
     robot.execute(delta)
     robot.execute(delta)
     np.testing.assert_allclose(robot.state_action16()[0], 0.02, atol=1e-7)
+
+
+def test_absolute_history_is_never_delta_encoded():
+    history = np.stack([_pose16(), _pose16()])
+    history[:, 0] = [0.25, 0.31]
+
+    model_history = encode_absolute_history(history)
+
+    np.testing.assert_allclose(model30_to_execution16(model_history), history)
+
+
+def test_absolute_and_delta_targets_only_differ_in_prediction_semantics():
+    initial = _pose16()
+    initial[0] = 0.2
+    target = initial.copy()
+    target[0] = 0.23
+
+    absolute, _ = encode_action_targets(
+        target[None], representation="absolute", references=initial[None]
+    )
+    delta, _ = encode_action_targets(
+        target[None], representation="delta", references=initial[None]
+    )
+
+    np.testing.assert_allclose(model30_to_execution16(absolute)[0, 0], 0.23)
+    np.testing.assert_allclose(model30_to_execution16(delta)[0, 0], 0.03)
+    np.testing.assert_allclose(
+        decode_action_sequence(
+            model30_to_execution16(absolute),
+            representation="absolute",
+            initial_absolute=initial,
+        ),
+        target[None],
+    )
+    np.testing.assert_allclose(
+        decode_action_sequence(
+            model30_to_execution16(delta),
+            representation="delta",
+            initial_absolute=initial,
+        ),
+        target[None],
+    )
 
 
 def test_real_robot_adapter_submits_eef_and_grippers_in_one_mixed_command():
@@ -160,6 +208,36 @@ def test_quest_rotation_does_not_modify_takeover_translation():
     )
 
 
+def test_index_trigger_maps_continuously_to_gripper_action():
+    np.testing.assert_allclose(index_trigger_to_gripper_action(0.0, 0.2), 1.0)
+    np.testing.assert_allclose(index_trigger_to_gripper_action(0.2, 0.2), 1.0)
+    np.testing.assert_allclose(index_trigger_to_gripper_action(0.6, 0.2), 0.5)
+    np.testing.assert_allclose(index_trigger_to_gripper_action(1.0, 0.2), 0.0)
+
+
+def test_quest_expert_action_uses_continuous_index_trigger_value():
+    class Robot:
+        config = AstribotRuntimeConfig(right_min_z=None)
+
+    source = QuestControlSource.__new__(QuestControlSource)
+    source.robot = Robot()
+    source.quest = SimpleNamespace(gripper_threshold=0.2)
+    source.anchor = _pose16()
+    source.anchor[15] = 1.0
+    info = {
+        "right": {
+            "active": True,
+            "index": 0.6,
+            "relative_position": [0.0, 0.0, 0.0],
+            "scaled_rotvec": [0.0, 0.0, 0.0],
+        }
+    }
+
+    target = source._expert_action(np.zeros(14, np.float32), info)
+
+    np.testing.assert_allclose(target[15], 0.5)
+
+
 def test_real_robot_adapter_clamps_a_tiny_right_arm_min_z_undershoot():
     robot = AstribotRobotIO.__new__(AstribotRobotIO)
     robot.config = AstribotRuntimeConfig(right_min_z=0.862)
@@ -228,6 +306,30 @@ def test_takeover_clamps_measured_right_z_below_safety_floor():
     assert sent[-1][10] >= 0.862
 
 
+def test_takeover_rate_limits_continuous_gripper_target():
+    robot = AstribotRobotIO.__new__(AstribotRobotIO)
+    robot.config = AstribotRuntimeConfig(
+        right_min_z=None,
+        takeover_max_gripper_step=0.02,
+    )
+    previous = _pose16()
+    previous[[7, 15]] = 1.0
+    robot._last_target = previous.copy()
+    robot._takeover_limited_target = previous.copy()
+    robot.action_history = deque()
+    sent = []
+    robot._send_target = lambda target, **_kwargs: sent.append(np.asarray(target).copy())
+    target = previous.copy()
+    target[15] = 0.0
+
+    robot.execute_takeover_absolute(
+        target, arm_command_mask={"left": False, "right": True}
+    )
+
+    np.testing.assert_allclose(sent[-1][15], 0.98, atol=1e-7)
+    np.testing.assert_allclose(sent[-1][7], 1.0, atol=1e-7)
+
+
 def test_policy_delta_chunk_is_sent_as_one_absolute_waypoint_trajectory():
     class WaypointRobot:
         torso_name = "torso"
@@ -258,6 +360,63 @@ def test_policy_delta_chunk_is_sent_as_one_absolute_waypoint_trajectory():
     np.testing.assert_allclose(times, [0.6, 0.7])
     np.testing.assert_allclose(targets[:, 8], [0.01, 0.03], atol=1e-7)
     assert kwargs == {"use_wbc": True, "add_default_torso": False}
+
+
+def test_policy_absolute_chunk_is_sent_without_delta_integration():
+    class WaypointRobot:
+        torso_name = "torso"
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+
+        def get_desired_cartesian_pose(self, names): return [[0, 0, 1, 0, 0, 0, 1]]
+        def move_cartesian_waypoints(self, names, waypoints, time_list, **kwargs): pass
+
+    adapter = AstribotRobotIO.__new__(AstribotRobotIO)
+    adapter.config = AstribotRuntimeConfig(
+        action_representation="absolute", right_min_z=None
+    )
+    adapter.action_representation = "absolute"
+    adapter.robot = WaypointRobot()
+    adapter._last_target = _pose16()
+    adapter._policy_chunk_count = 0
+    adapter.action_history = deque()
+    targets = np.tile(_pose16(), (2, 1))
+    targets[:, 8] = [0.01, 0.02]
+
+    executed = adapter.execute_policy_waypoints(targets)
+
+    np.testing.assert_allclose(executed[:, 8], [0.01, 0.02], atol=1e-7)
+    np.testing.assert_allclose(np.asarray(adapter.action_history)[:, 8], [0.01, 0.02])
+
+
+def test_policy_waypoint_clips_slightly_out_of_range_gripper_target():
+    class WaypointRobot:
+        torso_name = "torso"
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+
+        def __init__(self): self.calls = []
+        def get_desired_cartesian_pose(self, names): return [[0, 0, 1, 0, 0, 0, 1]]
+        def move_cartesian_waypoints(self, names, waypoints, time_list, **kwargs):
+            self.calls.append((names, waypoints, time_list, kwargs))
+
+    adapter = AstribotRobotIO.__new__(AstribotRobotIO)
+    adapter.config = AstribotRuntimeConfig(right_min_z=None)
+    adapter.robot = WaypointRobot()
+    adapter._last_target = _pose16()
+    adapter._policy_chunk_count = 0
+    adapter.action_history = deque()
+    delta = _pose16()
+    delta[15] = 1.0071225
+
+    targets = adapter.execute_policy_waypoints(delta.reshape(1, 16))
+
+    np.testing.assert_allclose(targets[0, 15], 1.0)
+    np.testing.assert_allclose(adapter.robot.calls[0][1][0][4], [0.0])
 
 
 def test_policy_returns_the_unsmoothed_server_chunk():
@@ -297,8 +456,29 @@ def test_policy_can_lock_the_left_arm_without_changing_the_right_action(capsys):
     assert "left arm/gripper locked" in capsys.readouterr().out
 
 
-def test_flowpro_uses_reference_delta_experiment_without_representation_switch():
+def test_absolute_policy_locks_left_arm_to_last_executed_cmd():
+    policy = WanVAPolicy(
+        host="127.0.0.1",
+        port=8006,
+        prompt="test",
+        replan_steps=1,
+        fake=True,
+        control_left_arm=False,
+        action_representation="absolute",
+    )
+    measured = _pose16()
+    measured[0] = 0.1
+    commanded = measured.copy()
+    commanded[0] = 0.25
+    payload = {"observation.executed_action_history": commanded[None]}
+
+    action = policy.infer({"wam4d": payload, "state_action16": measured})[0]
+
+    np.testing.assert_allclose(action[0:8], commanded[0:8])
+
+
+def test_flowpro_default_explicitly_uses_delta_representation():
     root = Path(__file__).resolve().parents[1]
     config = json.loads((root / "configs/flowpro.json").read_text())
     assert config["model"]["experiment_config"].endswith("/delta.json")
-    assert "action_representation" not in config["model"]
+    assert config["model"]["action_representation"] == "delta"

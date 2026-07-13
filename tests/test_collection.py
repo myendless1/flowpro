@@ -1,6 +1,11 @@
 import numpy as np
 import pytest
 from flowpro.collection import InputState, InterventionCollector, Phase
+from flowpro.cli.collect import (
+    _gate_takeover_retry_b,
+    _wait_for_a_reset,
+    _wait_for_a_start,
+)
 from flowpro.collection.rollback import RollbackConfig
 from flowpro.data import Frame, PairStore
 from wan_va.action_representation import apply_relative_pose7
@@ -29,21 +34,98 @@ class Policy:
         return np.tile(delta, (2,1))
 
 
+def test_reset_gate_requires_a_release_before_new_press(capsys):
+    class Controls:
+        def __init__(self):
+            self.states = iter([True, True, False, True])
+            self.poll_count = 0
+
+        def poll(self):
+            self.poll_count += 1
+            return InputState(a=next(self.states))
+
+    controls = Controls()
+
+    assert _wait_for_a_reset(controls, lambda: False, 0.0, 3) is True
+    assert controls.poll_count == 4
+    assert "Press A to move the robot" in capsys.readouterr().out
+
+
+def test_policy_start_gate_requires_a_release_before_new_press(capsys):
+    class Controls:
+        def __init__(self):
+            self.states = iter([True, False, True])
+            self.poll_count = 0
+
+        def poll(self):
+            self.poll_count += 1
+            return InputState(a=next(self.states))
+
+    controls = Controls()
+
+    assert _wait_for_a_start(controls, lambda: False, 0.0, 2) is True
+    assert controls.poll_count == 3
+    assert "press A to start policy inference" in capsys.readouterr().out
+
+
+def test_takeover_retry_b_requires_release_after_rollback_press():
+    held = InputState(b=True)
+    armed = _gate_takeover_retry_b(held, False)
+    assert armed is False
+    assert held.b is False
+
+    released = InputState(b=False)
+    armed = _gate_takeover_retry_b(released, armed)
+    assert armed is True
+
+    pressed_again = InputState(b=True)
+    assert _gate_takeover_retry_b(pressed_again, armed) is True
+    assert pressed_again.b is True
+
+
 def test_b_middle_a_commits_atomic_pair(tmp_path):
     robot = Robot(); c = InterventionCollector(robot, Policy(), PairStore(tmp_path), rollback=RollbackConfig(default_horizon=2))
     c.tick(InputState()); c.tick(InputState())
     assert c.tick(InputState(b=True)) is Phase.ROLLED_BACK
     assert c.tick(InputState(middle=1, expert_action=robot.action)) is Phase.TAKEOVER
     assert c.tick(InputState(a=True)) is Phase.POLICY
+    assert c.last_pair_saved is True
     target = next(tmp_path.iterdir())
     assert (target / "winner.npz").exists() and (target / "loser.npz").exists()
+    pair = PairStore(tmp_path).load(target)
+    assert pair.metadata["stored_action_representation"] == "delta"
+    assert pair.metadata["history_action_representation"] == "absolute"
 
 
-def test_a_before_takeover_is_rejected(tmp_path):
+def test_a_before_takeover_discards_rollback_without_saving_pair(tmp_path, capsys):
     robot = Robot(); c = InterventionCollector(robot, Policy(), PairStore(tmp_path), rollback=RollbackConfig(default_horizon=1))
     c.tick(InputState()); c.tick(InputState(b=True)); c.tick(InputState())
-    with pytest.raises(RuntimeError, match="middle-trigger"):
-        c.tick(InputState(a=True))
+
+    assert c.tick(InputState(a=True)) is Phase.POLICY
+    assert c.last_pair_saved is False
+    assert list(tmp_path.iterdir()) == []
+    assert "No middle-trigger correction recorded" in capsys.readouterr().out
+
+
+def test_b_during_takeover_discards_pair_and_requests_episode_retry(tmp_path, capsys):
+    robot = Robot()
+    collector = InterventionCollector(
+        robot,
+        Policy(),
+        PairStore(tmp_path),
+        rollback=RollbackConfig(default_horizon=1),
+    )
+    collector.tick(InputState())
+    collector.tick(InputState(b=True))
+    collector.tick(InputState())
+    collector.tick(InputState(middle=1, expert_action=robot.action))
+
+    assert collector.tick(InputState(b=True)) is Phase.POLICY
+    assert collector.last_pair_discarded is True
+    assert collector.last_pair_saved is False
+    assert len(collector.buffer.frames) == 0
+    assert list(tmp_path.iterdir()) == []
+    assert "discarding the pair" in capsys.readouterr().out
 
 
 def test_start_episode_clears_state_and_resets_runtime(tmp_path):

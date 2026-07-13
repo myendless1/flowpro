@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from astribot_env.utils import ACTION16_DIM, actions_from_wam4d_response
+from wan_va.action_representation import validate_action_representation
 
 
 class WAM4DPriorClient:
@@ -21,6 +22,7 @@ class WAM4DPriorClient:
         save_visualization: bool = False,
         video_guidance_scale: float = 5.0,
         action_guidance_scale: float = 5.0,
+        action_representation: str = "delta",
         fake: bool = False,
     ) -> None:
         self.prompt = prompt
@@ -31,6 +33,7 @@ class WAM4DPriorClient:
         self.save_visualization = bool(save_visualization)
         self.video_guidance_scale = float(video_guidance_scale)
         self.action_guidance_scale = float(action_guidance_scale)
+        self.action_representation = validate_action_representation(action_representation)
         self.fake = bool(fake)
         if self.fake:
             self.policy = None
@@ -43,6 +46,18 @@ class WAM4DPriorClient:
             )
 
             self.policy = WebsocketClientPolicy(host=host, port=port)
+            metadata = self.policy.get_server_metadata()
+            server_representation = metadata.get("action_representation")
+            if server_representation != self.action_representation:
+                raise RuntimeError(
+                    "WAM4D action representation mismatch: "
+                    f"collector={self.action_representation!r}, "
+                    f"server={server_representation!r}"
+                )
+            if metadata.get("state_action_representation") != "absolute":
+                raise RuntimeError(
+                    "WAM4D server must declare absolute state/action history"
+                )
         self.last_raw_action: np.ndarray | None = None
 
     def reset(self) -> None:
@@ -69,11 +84,14 @@ class WAM4DPriorClient:
         max_steps: int | None = None,
     ) -> np.ndarray:
         if self.fake:
-            action = np.zeros((ACTION16_DIM,), dtype=np.float32)
-            action[[3, 11]] = 1.0
-            if fallback_state16 is not None:
-                state = np.asarray(fallback_state16, dtype=np.float32).reshape(ACTION16_DIM)
-                action[[7, 15]] = state[[7, 15]]
+            if self.action_representation == "absolute" and fallback_state16 is not None:
+                action = np.asarray(fallback_state16, dtype=np.float32).reshape(ACTION16_DIM).copy()
+            else:
+                action = np.zeros((ACTION16_DIM,), dtype=np.float32)
+                action[[3, 11]] = 1.0
+                if fallback_state16 is not None:
+                    state = np.asarray(fallback_state16, dtype=np.float32).reshape(ACTION16_DIM)
+                    action[[7, 15]] = state[[7, 15]]
             steps = max(1, int(max_steps or 1))
             return np.repeat(action.reshape(1, ACTION16_DIM), steps, axis=0)
 

@@ -148,6 +148,16 @@ def index_trigger_to_gripper_residual(index: float, threshold: float, deadband: 
     return float(deadband + close_fraction * (1.0 - deadband))
 
 
+def index_trigger_to_gripper_action(index: float, threshold: float) -> float:
+    """Map the analog index trigger to 1=open, 0=closed continuously."""
+    threshold = float(np.clip(threshold, 0.0, 0.999))
+    index = float(np.clip(index, 0.0, 1.0))
+    close_fraction = np.clip(
+        (index - threshold) / max(1.0 - threshold, 1e-6), 0.0, 1.0
+    )
+    return float(1.0 - close_fraction)
+
+
 class QuestResidualIntervention:
     def __init__(
         self,

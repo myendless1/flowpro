@@ -1,13 +1,13 @@
-"""Delta-EEF representation shared by training and inference.
+"""Astribot action representations shared by training and inference.
 
 The 16-D command layout is::
 
-    left delta_xyz+relative_wxyz+absolute_gripper,
-    right delta_xyz+relative_wxyz+absolute_gripper
+    left xyz+wxyz+absolute_gripper,
+    right xyz+wxyz+absolute_gripper
 
-The diffusion model keeps its historical 30-D layout. Delta EEF targets occupy
-the execution channels and optional release-pose targets occupy
-the otherwise unused 14 channels.
+The diffusion model keeps its historical 30-D layout. Executed-action history
+is always absolute. Predicted action targets can be absolute or delta EEF;
+optional release-pose targets occupy the otherwise unused 14 channels.
 """
 
 from __future__ import annotations
@@ -21,6 +21,26 @@ EXECUTION_CHANNEL_IDS = tuple(
 LEFT_RELEASE_CHANNEL_IDS = tuple(range(14, 21))
 RIGHT_RELEASE_CHANNEL_IDS = tuple(range(21, 28))
 RELEASE_CHANNEL_IDS = LEFT_RELEASE_CHANNEL_IDS + RIGHT_RELEASE_CHANNEL_IDS
+ACTION_REPRESENTATIONS = ("absolute", "delta")
+
+
+def validate_action_representation(value: str) -> str:
+    representation = str(value).strip().lower()
+    if representation not in ACTION_REPRESENTATIONS:
+        raise ValueError(
+            f"Unsupported action representation {value!r}; "
+            f"expected one of {ACTION_REPRESENTATIONS}"
+        )
+    return representation
+
+
+def execution16_to_model30(execution_actions: np.ndarray) -> np.ndarray:
+    execution = np.asarray(execution_actions, dtype=np.float32)
+    if execution.ndim != 2 or execution.shape[1] != 16:
+        raise ValueError(f"Expected execution actions [T,16], got {execution.shape}")
+    model = np.zeros((execution.shape[0], 30), dtype=np.float32)
+    model[:, EXECUTION_CHANNEL_IDS] = execution
+    return model
 
 
 def normalize_quaternion_wxyz(quaternion: np.ndarray) -> np.ndarray:
@@ -105,9 +125,8 @@ def delta16_to_model30(
     encoded16[:, 8:15] = relative_pose7(references[:, 8:15], absolute[:, 8:15])
     # Gripper targets remain absolute, matching delta.json statistics.
 
-    model = np.zeros((absolute.shape[0], 30), dtype=np.float32)
+    model = execution16_to_model30(encoded16)
     mask = np.zeros_like(model, dtype=bool)
-    model[:, EXECUTION_CHANNEL_IDS] = encoded16
     mask[:, EXECUTION_CHANNEL_IDS] = True
 
     if release_poses is not None:
@@ -142,6 +161,39 @@ def delta16_to_model30(
     return model, mask
 
 
+def encode_action_targets(
+    absolute_actions: np.ndarray,
+    *,
+    representation: str,
+    references: np.ndarray | None = None,
+    release_poses: np.ndarray | None = None,
+    release_references: np.ndarray | None = None,
+    release_valid: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Encode absolute command targets using the configured prediction semantics."""
+    representation = validate_action_representation(representation)
+    absolute = np.asarray(absolute_actions, dtype=np.float32)
+    if representation == "delta":
+        return delta16_to_model30(
+            absolute,
+            references=references,
+            release_poses=release_poses,
+            release_references=release_references,
+            release_valid=release_valid,
+        )
+    if release_poses is not None:
+        raise ValueError("release-pose auxiliary targets require delta action representation")
+    model = execution16_to_model30(absolute)
+    mask = np.zeros_like(model, dtype=bool)
+    mask[:, EXECUTION_CHANNEL_IDS] = True
+    return model, mask
+
+
+def encode_absolute_history(absolute_history: np.ndarray) -> np.ndarray:
+    """Place past executed absolute cmd actions in the model's 30-D channels."""
+    return execution16_to_model30(absolute_history)
+
+
 def model30_to_execution16(model_actions: np.ndarray) -> np.ndarray:
     model = np.asarray(model_actions, dtype=np.float32)
     return model[..., EXECUTION_CHANNEL_IDS].astype(np.float32, copy=False)
@@ -167,6 +219,22 @@ def decode_execution_sequence(
         decoded[index] = current
         previous = current
     return decoded
+
+
+def decode_action_sequence(
+    execution_actions: np.ndarray,
+    *,
+    representation: str,
+    initial_absolute: np.ndarray,
+) -> np.ndarray:
+    """Convert model execution channels to absolute cmd actions."""
+    representation = validate_action_representation(representation)
+    actions = np.asarray(execution_actions, dtype=np.float32)
+    if actions.ndim != 2 or actions.shape[1] != 16:
+        raise ValueError(f"Expected execution sequence [T,16], got {actions.shape}")
+    if representation == "absolute":
+        return actions.copy()
+    return decode_execution_sequence(actions, initial_absolute=initial_absolute)
 
 
 def absolute_history_to_delta(history: np.ndarray) -> np.ndarray:

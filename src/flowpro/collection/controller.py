@@ -31,7 +31,7 @@ class InputState:
 
 
 class InterventionCollector:
-    """B -> rollback; hold middle -> teleoperate/record; A -> commit pair."""
+    """B -> rollback/retry; hold middle -> teleoperate; A -> commit pair."""
 
     def __init__(self, robot: RobotIO, policy: Policy, store: PairStore, *,
                  rollback: RollbackConfig | None = None, round_id: int = 1,
@@ -45,6 +45,8 @@ class InterventionCollector:
         self._winner_previous_observation: dict | None = None
         self._prev_b = self._prev_a = False
         self._prev_middle_active = False
+        self.last_pair_saved = False
+        self.last_pair_discarded = False
 
     def start_episode(self) -> None:
         """Clear transient collection state before policy control is enabled."""
@@ -53,6 +55,8 @@ class InterventionCollector:
         self._winner_previous_observation = None
         self._prev_b = self._prev_a = False
         self._prev_middle_active = False
+        self.last_pair_saved = False
+        self.last_pair_discarded = False
         self.phase = Phase.POLICY
         state = self.robot.state_action16()
         if hasattr(self.robot, "reset_history"):
@@ -60,6 +64,8 @@ class InterventionCollector:
         self.policy.reset(None)
 
     def tick(self, controls: InputState) -> Phase:
+        self.last_pair_saved = False
+        self.last_pair_discarded = False
         b_edge, a_edge = controls.b and not self._prev_b, controls.a and not self._prev_a
         middle_active = controls.middle >= self.threshold
         middle_edge = middle_active and not self._prev_middle_active
@@ -83,8 +89,17 @@ class InterventionCollector:
             self.policy.reset(self._loser[0].observation)
             self._winner_previous_observation = self.robot.observe()
             self.phase = Phase.ROLLED_BACK
+            return self.phase
 
         if self.phase in (Phase.ROLLED_BACK, Phase.TAKEOVER):
+            if b_edge:
+                print(
+                    "B pressed during takeover; discarding the pair and retrying the episode.",
+                    flush=True,
+                )
+                self.last_pair_discarded = True
+                self._clear_takeover()
+                return self.phase
             if self.phase is Phase.TAKEOVER and controls.record:
                 self._append_winner_state_transition(self.robot.observe())
             if middle_active:
@@ -108,21 +123,27 @@ class InterventionCollector:
                 self.phase = Phase.TAKEOVER
             if a_edge:
                 if not self._winner:
-                    raise RuntimeError("A cannot finish before a middle-trigger correction is recorded")
-                pair = TrajectoryPair(
-                    pair_id=f"r{self.round_id:02d}-{time.time_ns()}-{uuid.uuid4().hex[:8]}",
-                    loser=self._loser, winner=self._winner, rollback_index=0,
-                    round_id=self.round_id,
-                    metadata={"control": "B rollback, middle takeover, A finish"},
-                )
-                self.store.save(pair)
-                self._loser, self._winner = [], []
-                self._winner_previous_observation = None
-                self.buffer = RollbackBuffer(self.buffer.config)
-                end_takeover = getattr(self.robot, "end_takeover", None)
-                if callable(end_takeover):
-                    end_takeover()
-                self.phase = Phase.POLICY
+                    print(
+                        "No middle-trigger correction recorded; discarding rollback and ending episode.",
+                        flush=True,
+                    )
+                else:
+                    pair = TrajectoryPair(
+                        pair_id=f"r{self.round_id:02d}-{time.time_ns()}-{uuid.uuid4().hex[:8]}",
+                        loser=self._loser, winner=self._winner, rollback_index=0,
+                        round_id=self.round_id,
+                        metadata={
+                            "control": "B rollback, middle takeover, A finish",
+                            "policy_action_representation": str(
+                                getattr(self.policy, "action_representation", "delta")
+                            ),
+                            "stored_action_representation": "delta",
+                            "history_action_representation": "absolute",
+                        },
+                    )
+                    self.store.save(pair)
+                    self.last_pair_saved = True
+                self._clear_takeover()
             return self.phase
 
         obs = self.robot.observe()
@@ -134,22 +155,45 @@ class InterventionCollector:
             targets = np.asarray(execute_waypoints(chunk), np.float32).reshape(-1, 16)
             self.buffer = RollbackBuffer(self.buffer.config)
             references = np.concatenate([initial_target.reshape(1, 16), targets[:-1]], axis=0)
-            for action, reference, target in zip(chunk, references, targets):
+            for reference, target in zip(references, targets):
                 frame_obs = dict(obs)
                 frame_obs["state_action16"] = reference.copy()
                 frame_obs["_flowpro_rollback_target16"] = target.copy()
-                self.buffer.append(Frame(frame_obs, action, source="policy"))
+                self.buffer.append(
+                    Frame(frame_obs, self._delta_between(reference, target), source="policy")
+                )
         else:
             action = chunk[0]
+            initial_target = self.robot.command_target16()
             self.robot.execute(action)
             if bool(getattr(self.policy, "last_inference_started_chunk", False)):
                 self.buffer = RollbackBuffer(self.buffer.config)
             command_target = getattr(self.robot, "command_target16", None)
             if callable(command_target):
                 obs = dict(obs)
-                obs["_flowpro_rollback_target16"] = command_target()
+                target = command_target()
+                obs["_flowpro_rollback_target16"] = target
+                action = self._delta_between(initial_target, target)
             self.buffer.append(Frame(obs, action, source="policy"))
         return self.phase
+
+    def _clear_takeover(self) -> None:
+        self._loser, self._winner = [], []
+        self._winner_previous_observation = None
+        self.buffer = RollbackBuffer(self.buffer.config)
+        end_takeover = getattr(self.robot, "end_takeover", None)
+        if callable(end_takeover):
+            end_takeover()
+        self.phase = Phase.POLICY
+
+    @staticmethod
+    def _delta_between(reference: np.ndarray, target: np.ndarray) -> np.ndarray:
+        reference = np.asarray(reference, np.float32).reshape(16)
+        target = np.asarray(target, np.float32).reshape(16)
+        delta = target.copy()
+        delta[0:7] = relative_pose7(reference[0:7], target[0:7])
+        delta[8:15] = relative_pose7(reference[8:15], target[8:15])
+        return delta
 
     def _append_winner_state_transition(self, current_observation: dict) -> None:
         previous_observation = self._winner_previous_observation
@@ -158,8 +202,6 @@ class InterventionCollector:
             return
         previous = np.asarray(previous_observation["state_action16"], np.float32).reshape(16)
         current = np.asarray(current_observation["state_action16"], np.float32).reshape(16)
-        delta = current.copy()
-        delta[0:7] = relative_pose7(previous[0:7], current[0:7])
-        delta[8:15] = relative_pose7(previous[8:15], current[8:15])
+        delta = self._delta_between(previous, current)
         self._winner.append(Frame(previous_observation, delta, source="human"))
         self._winner_previous_observation = current_observation

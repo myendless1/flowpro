@@ -1,8 +1,8 @@
 # no4d ablation configurations
 
-The same JSON file is consumed by training, the inference server, and the
-Astribot client. Relative paths are resolved from the repository working
-directory.
+The same experiment JSON is consumed by training and the inference server.
+The FlowPRO project config selects the matching client execution semantics.
+Relative paths are resolved from the repository working directory.
 
 | Config | Action target | Action backbone | Auxiliary target | Views |
 |---|---|---|---|---|
@@ -15,6 +15,9 @@ directory.
 Gripper targets remain absolute for every action representation. Robot-facing
 commands remain the historical 16-D layout. Release-pose channels are enabled
 only in the training loss and are removed by server execution postprocessing.
+Executed-action history is always encoded as absolute cmd action in both modes.
+`state_norm_stat` therefore retains the task's absolute statistics while a
+delta experiment's `norm_stat` applies only to predicted action targets.
 
 ## Training
 

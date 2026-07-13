@@ -44,8 +44,17 @@ def load_experiment_config(path: str | Path, config_registry: dict) -> EasyDict:
             f"Unknown base_config '{base_name}'; available={sorted(config_registry)}"
         )
     config = EasyDict(copy.deepcopy(dict(config_registry[base_name])))
+    # State/action history is always absolute cmd action, even when the model
+    # predicts delta actions. Preserve the task config's absolute statistics
+    # before an experiment overrides norm_stat with delta target statistics.
+    if "state_norm_stat" not in payload and "norm_stat" in config:
+        config.state_norm_stat = copy.deepcopy(config.norm_stat)
     config = _merge(config, payload)
+    config.state_action_representation = str(
+        getattr(config, "state_action_representation", "absolute")
+    )
+    if config.state_action_representation != "absolute":
+        raise ValueError("state_action_representation must be 'absolute'")
     config.experiment_config_path = str(path)
     config.experiment_name = str(config.get("experiment_name", path.stem))
     return config
-

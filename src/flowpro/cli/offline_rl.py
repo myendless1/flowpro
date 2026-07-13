@@ -18,6 +18,18 @@ def _has_transformer_checkpoint(path: Path) -> bool:
 
 def _validate(spec):
     missing=[]
+    expected_representation = str(spec.get("action_representation", "delta"))
+    preference_dirs = [spec["current_preferences"], *spec["historical_preferences"]]
+    for directory in preference_dirs:
+        manifest_path = Path(directory) / "manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            actual = manifest.get("action_representation", "delta")
+            if actual != expected_representation:
+                missing.append(
+                    f"preference representation: {directory} "
+                    f"expected={expected_representation}, actual={actual}"
+                )
     current=Path(spec["current_preferences"])
     if not any(current.glob("*.npz")): missing.append(f"preference samples: {current}")
     for path in spec["historical_preferences"]:
@@ -45,7 +57,9 @@ def main():
           "base_checkpoint":str(cfg.path_for("model.base_checkpoint")),
           "historical_preferences":[str(cfg.round_dir(i)/"preference_dataset") for i in range(1,a.round)],
           "sft_dataset":str(cfg.path_for("paths.sft_dataset")),"output":str(out.resolve()),"steps":a.steps,
-          "batch_size":a.batch_size,"batch_counts":batch_counts(a.batch_size,a.round),**cfg.section("offline_rl")}
+          "batch_size":a.batch_size,"batch_counts":batch_counts(a.batch_size,a.round),
+          "action_representation":cfg.section("model").get("action_representation","delta"),
+          **cfg.section("offline_rl")}
     spec_file = out/"training_spec.json"
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:

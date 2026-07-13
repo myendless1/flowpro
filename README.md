@@ -4,16 +4,16 @@
 
 ## 闭环
 
-1. 使用 `wan_va.wan_va_server.VA_Server` 加载本仓库内的 Wan-VA/no4d delta 模型并输出 30-D action；客户端提取 Astribot 16-D delta EEF 命令。
+1. 使用 `wan_va.wan_va_server.VA_Server` 加载 Wan-VA/no4d absolute 或 delta 模型并输出 30-D action；客户端提取 Astribot 16-D 命令，并按照配置解释预测语义。
 2. `InterventionCollector` 正常执行策略并保留环形回退缓存。
-3. 操作者按 **B**：冻结最近 `rollback_horizon` 个策略帧作为 loser，并用实时状态计算 delta EEF 命令回退。
+3. 操作者按 **B**：冻结最近 `rollback_horizon` 个策略帧作为 loser，并反向重放实际执行的 absolute cmd waypoint。
 4. 回退完成后按住 **middle trigger**：执行并逐 tick 记录星尘/Quest 专家动作作为 winner。
-5. 按 **A**：校验后原子写入 `loser.npz`、`winner.npz`、观测 JSONL 和元数据。未采到接管动作时 A 会拒绝提交。
+5. 按 **A**：校验后原子写入 `loser.npz`、`winner.npz`、观测 JSONL 和元数据。未采到接管动作时结束 episode，但不写入 pair。
 6. `augment_pair` 对 loser 状态用最近 winner 点、三次 Bézier（位置）、Slerp（姿态）与线性插值（夹爪）生成缺失的 winner chunk；winner 状态构造 identical pair。
 7. `rpro_loss` 实现论文 Eq. 3–6。SFT 和正轨迹样本以 identical pair 进入同一目标；第 1 轮 batch 为 current/SFT=80/20，后续轮为 current/history/SFT=70/15/15。winner/loser/current/reference 共享噪声、flow timestep 和条件输入。
 8. 每轮训练前冻结当前 transformer 为 reference，训练产物保存到 `checkpoints/last/transformer`；下一轮推理通过 `--transformer-source` 加载该权重。
 
-Quest 和 SDK 命令默认以 100 Hz 更新，策略 waypoint、偏好观测和动作样本以 10 Hz 记录；Wan-VA action chunk 为 32 steps。默认回退 64 个 10 Hz 策略帧，从而在排除最后一个完整 action chunk 后仍能生成负样本。上述频率必须与实际 SFT 数据保持一致。
+Quest 和 SDK 命令默认以 100 Hz 更新，策略 waypoint、偏好观测和动作样本以 10 Hz 记录；Wan-VA action chunk 为 32 steps。输入模型的 action history 在两个模式下都使用过去实际下发的 absolute cmd action。默认回退 64 个 10 Hz 策略帧，从而在排除最后一个完整 action chunk 后仍能生成负样本。上述频率必须与实际 SFT 数据保持一致。
 
 ## 代码对应
 
@@ -68,11 +68,11 @@ cd /home/xddex05/repo/flowpro
 
 真实机器人采集按 episode 门控执行：
 
-1. 终端提示后第一次按 Enter，机器人移动到配置的 `init_joint_action` 初始位姿。
-2. 整理任务场景，按 B 开始执行第一个策略 action chunk。
+1. 终端提示后按 Quest 右手柄 A，机器人移动到配置的 `init_joint_action` 初始位姿。
+2. 整理任务场景，松开 A 后再次按 A，开始执行第一个策略 action chunk。
 3. 每个 chunk 完成后进入按键等待：短按 A 执行下一个 chunk，长按 A 至少 2 秒结束本轮，按 B 回退刚完成的 chunk 并进入接管。
-4. 接管状态下按住 middle trigger 控制机器人，并按 10Hz 记录实测 state delta 和图像；短按或长按 A 都会保存偏好对并结束本轮。
-5. 下一轮再次按 Enter 复位，然后按 B 开始推理。
+4. 接管状态下按住 middle trigger 控制机器人，index trigger 在 `collection.gripper_trigger_threshold` 死区后连续控制夹爪，并按 10Hz 记录实测 state delta 和图像；夹爪每个控制 tick 的最大变化由 `collection.takeover_max_gripper_step` 限制。录到至少一段 correction 后，短按或长按 A 会保存偏好对并结束本轮。按 B 会丢弃当前 loser/winner、不保存也不计入 `collection.target_pairs`，随后保持相同 episode 编号并重新采集这条正负样本。如果回退后发现已经没有必要录制，或任务进入不可能完成的状态，可以不按 middle 直接按 A，本轮会结束但不会保存偏好对、也不会计入 `collection.target_pairs`。
+5. 下一轮再次按 A 复位，整理场景后再按 A 开始推理。每个 A 门控都会先等待按键释放，因此上一步的 A 不会误触发下一步。
 
 B 只回退当前 Wan-VA action chunk 中已经执行的动作，不再回退整个 episode。
 
@@ -111,30 +111,29 @@ python -m flowpro.cli.collect --output /tmp/flowpro-pairs --fake --fake-pairs 2 
 
 ## 数据约束与安全
 
-动作统一为 `[left delta_xyz+relative_wxyz+absolute_gripper, right delta_xyz+relative_wxyz+absolute_gripper]`。机器人适配器按照 Astribot 在线控制示例，以实时 EEF 为参考逐 tick 应用 delta，并包含有限值、单步位移和旋转检查；现场仍必须由 Astribot 控制器提供工作空间、碰撞和急停保护。RGB/状态数组自动写入压缩 NPZ sidecar，JSON 只保存结构和引用。Smooth Interpolation 会排除 loser 的最后一个 action-chunk，避免对接触风险最高的危险尾段做增广。
+16-D 命令布局固定为 `[left xyz+wxyz+absolute_gripper, right xyz+wxyz+absolute_gripper]`，但预测语义由 `model.action_representation` 决定：`delta` 模式的 xyz/四元数分别表示位移和相对旋转，`absolute` 模式直接表示 cmd target；夹爪在两个模式下始终是绝对值。机器人适配器会把两种预测都转换成 absolute waypoint 后下发 SDK，并将实际下发的 absolute cmd 写入 history。所有模式都执行有限值、单步位移、旋转和工作空间检查；现场仍必须由 Astribot 控制器提供碰撞和急停保护。RGB/状态数组自动写入压缩 NPZ sidecar，JSON 只保存结构和引用。Smooth Interpolation 会排除 loser 的最后一个 action-chunk，避免对接触风险最高的危险尾段做增广。
 
 ## 统一配置与脚本
 
-全流程只使用 [configs/flowpro.json](configs/flowpro.json)。相对路径按项目根目录解析，也允许像当前 SFT 数据一样显式配置绝对路径；脚本可以从任意工作目录启动。`paths.pretrain_save_dir` 只作为 SFT/pretrain 阶段的保存根目录；首轮推理和第 1 轮 RPRO reference 读取 `paths.pretrained_transformer_dir`，它可以是直接的 transformer `save_pretrained` 目录，也可以是包含 `transformer/` 或 `checkpoints/last/transformer` 的 checkpoint root。后续第 N 轮读取 `outputs/rounds/round_(N-1)/offline_rl`。
+公共配置位于 [configs/flowpro.json](configs/flowpro.json)，实际双模式入口为 [configs/flowpro.delta.json](configs/flowpro.delta.json) 和 [configs/flowpro.absolute.json](configs/flowpro.absolute.json)。两者通过 `base_config` 继承公共硬件、任务和训练参数，只覆盖 action representation、experiment config、首轮模型权重和输出目录。delta 与 absolute 的 round、manifest 和 pretrain 输出相互隔离，不能在同一个 round 目录混用 preference 数据或 RPRO checkpoint。
+
+相对路径按项目根目录解析，也允许像当前 SFT 数据一样显式配置绝对路径；脚本可以从任意工作目录启动。`paths.pretrain_save_dir` 只作为 SFT/pretrain 阶段的保存根目录；首轮推理和第 1 轮 RPRO reference 读取 `paths.pretrained_transformer_dir`，它可以是直接的 transformer `save_pretrained` 目录，也可以是包含 `transformer/` 或 `checkpoints/last/transformer` 的 checkpoint root。`inference.checkpoint_source` 默认为 `auto`：第 N 轮优先读取当前模式上一轮的 `offline_rl`，不存在时明确告警并回退到 `paths.pretrained_transformer_dir`。设为 `previous_round` 可要求严格使用上一轮 RPRO 权重，设为 `pretrained` 可始终使用预训练权重。
 
 首次运行必须设置 `collection.prompt`，并通过 `collection.sdk_root` 或环境变量 `ASTRIBOT_SDK_ROOT` 指向 Astribot 官方 SDK。SDK 是硬件驱动依赖，不从参考工程导入。
 
 ```bash
-# All scripts default to configs/flowpro.json.
-./scripts/00_validate.sh --hardware
-./scripts/07_run_pipeline.sh --dry-run
+# Delta mode
+./scripts/00_validate.sh --config configs/flowpro.delta.json --hardware
+./scripts/02_inference.sh --config configs/flowpro.delta.json --round 1
+./scripts/03_collect_preferences.sh --config configs/flowpro.delta.json --round 1
 
-# Model training and inference (default: FLOWPRO_TRAIN_PYTHON=.../envs/lingbot/bin/python)
-./scripts/01_pretrain.sh
-./scripts/02_inference.sh --round 1
-
-# Hardware collection (default: FLOWPRO_ROBOT_PYTHON=.../envs/astribot/bin/python)
-./scripts/03_collect_preferences.sh --round 1
-
-# Augmentation and RPRO
-./scripts/04_augment_preferences.sh --round 1
-./scripts/05_offline_rl.sh --round 1
+# Absolute mode
+./scripts/00_validate.sh --config configs/flowpro.absolute.json --hardware
+./scripts/02_inference.sh --config configs/flowpro.absolute.json --round 10
+./scripts/03_collect_preferences.sh --config configs/flowpro.absolute.json --round 10
 ```
+
+同一轮的 `augment`、`offline-rl`、`round` 和 `all` 必须继续传入同一份模式配置。未指定 `--config` 时仍默认使用 `configs/flowpro.json`，其行为与 delta 模式兼容；建议实机流程显式选择上述子配置。
 
 Use `FLOWPRO_CONFIG=/path/to/config.json` for another default, or pass
 `--config /path/to/config.json` to one script. `FLOWPRO_TRAIN_PYTHON`,
@@ -143,6 +142,6 @@ corresponding interpreter or device.
 
 `scripts/06_run_round.sh` 和 `scripts/07_run_pipeline.sh` 会用同一个训练解释器自动启动推理与采集，因此仍只适用于离线或模拟流程。实机采集必须按上述分阶段 Bash 脚本运行，保证推理服务和 Python 3.8 Astribot collector 分别处于各自环境中。
 
-每一阶段成功后会在 `outputs/manifests` 写入命令、配置和输出路径记录。采集在新增 `collection.target_pairs` 个有效 pair 后自动进入增广和训练；设为 `0` 时持续到 Ctrl-C。
+每一阶段成功后会在当前模式的 `paths.manifests` 写入命令、配置和输出路径记录。采集在新增 `collection.target_pairs` 个有效 pair 后自动进入增广和训练；设为 `0` 时持续到 Ctrl-C。
 
 真实机器人第一次运行前必须先以低速、空工作区验证坐标系、四元数顺序、工作空间、碰撞与急停。软件冒烟测试不能替代硬件验收。

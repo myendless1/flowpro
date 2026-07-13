@@ -23,7 +23,8 @@ from configs import VA_CONFIGS
 from configs.experiment import load_experiment_config
 from action_representation import (
     EXECUTION_CHANNEL_IDS,
-    absolute_history_to_delta,
+    encode_absolute_history,
+    validate_action_representation,
 )
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
@@ -339,14 +340,13 @@ class VA_Server:
             raise ValueError(
                 f"Expected state to have shape [T,D], but got {tuple(state_model_input.shape)}"
             )
-        represented = absolute_history_to_delta(state_model_input.numpy())
-        model_state = np.zeros((represented.shape[0], 30), dtype=np.float32)
-        model_state[:, EXECUTION_CHANNEL_IDS] = represented
-        state_model_input = torch.from_numpy(model_state)
+        state_model_input = torch.from_numpy(
+            encode_absolute_history(state_model_input.numpy())
+        )
 
         if self.action_norm_method == 'quantiles':
-            state_model_input = (state_model_input - self.actions_q01[:, 0, 0][None]) / (
-                self.actions_q99[:, 0, 0][None] - self.actions_q01[:, 0, 0][None] + 1e-6) * 2. - 1.
+            state_model_input = (state_model_input - self.state_q01[:, 0, 0][None]) / (
+                self.state_q99[:, 0, 0][None] - self.state_q01[:, 0, 0][None] + 1e-6) * 2. - 1.
             state_model_input = torch.clamp(state_model_input, -1.5, 1.5)
         else:
             raise NotImplementedError
@@ -649,6 +649,13 @@ class VA_Server:
                                                 dtype=torch.float32).reshape(-1, 1, 1)
                 self.actions_q99 = torch.tensor(self.job_config.norm_stat['q99'],
                                                 dtype=torch.float32).reshape(-1, 1, 1)
+                state_norm_stat = getattr(
+                    self.job_config, 'state_norm_stat', self.job_config.norm_stat
+                )
+                self.state_q01 = torch.tensor(state_norm_stat['q01'],
+                                              dtype=torch.float32).reshape(-1, 1, 1)
+                self.state_q99 = torch.tensor(state_norm_stat['q99'],
+                                              dtype=torch.float32).reshape(-1, 1, 1)
                 self.action_norm_method = self.job_config.action_norm_method
 
             ##### get prompt
@@ -1055,6 +1062,11 @@ def run(args):
             "'astribot_pick_white_plate', 'astribot_sort_bottles', "
             "or 'astribot_lixinji'."
         )
+    config.action_representation = validate_action_representation(
+        getattr(config, "action_representation", "absolute")
+    )
+    if getattr(config, "state_action_representation", "absolute") != "absolute":
+        raise ValueError("state/action history must use absolute cmd actions")
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
@@ -1095,7 +1107,8 @@ def run(args):
             port,
             metadata={
                 "experiment_name": str(getattr(config, "experiment_name", args.config_name)),
-                "action_representation": "delta",
+                "action_representation": config.action_representation,
+                "state_action_representation": "absolute",
                 "action_head_type": str(getattr(config, "action_head_type", "shared")),
                 "obs_cam_keys": list(config.obs_cam_keys),
             },

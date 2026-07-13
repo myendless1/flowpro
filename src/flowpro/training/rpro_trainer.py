@@ -250,6 +250,12 @@ def run_rpro(spec_path: str | Path, *, config_name: str, experiment_config: str)
 
     spec = json.loads(Path(spec_path).read_text())
     config = load_experiment_config(experiment_config, VA_CONFIGS)
+    expected_representation = str(spec.get("action_representation", "delta"))
+    if str(config.action_representation) != expected_representation:
+        raise ValueError(
+            "RPRO action representation mismatch: "
+            f"spec={expected_representation}, experiment={config.action_representation}"
+        )
     config.dataset_paths = [spec["sft_dataset"]]
     config.empty_emb_path = str(Path(spec["sft_dataset"]) / "empty_emb.pt")
     reference_root = Path(spec["reference_checkpoint"])

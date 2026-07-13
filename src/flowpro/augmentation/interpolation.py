@@ -55,7 +55,7 @@ def _frame_state(frame: Frame) -> np.ndarray:
 
 
 def _frame_target(frame: Frame) -> np.ndarray:
-    """Recover absolute geometry only for interpolation; model/runtime stay delta."""
+    """Recover absolute geometry from the canonical stored frame delta."""
     state = _frame_state(frame)
     delta = np.asarray(frame.action, np.float32).reshape(16)
     target = state.copy()
