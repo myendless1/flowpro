@@ -1,0 +1,13 @@
+{
+  "base_config": "flowpro.json",
+  "paths": {
+    "pretrain_save_dir": "outputs/pretrain/delta",
+    "pretrained_transformer_dir": "outputs/pretrain/no4d-abl-delta-3500",
+    "rounds": "outputs/delta/rounds",
+    "manifests": "outputs/delta/manifests"
+  },
+  "model": {
+    "experiment_config": "src/wan_va/experiment_configs/delta.json",
+    "action_representation": "delta"
+  }
+}

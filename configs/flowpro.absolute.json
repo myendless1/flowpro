@@ -1,0 +1,13 @@
+{
+  "base_config": "flowpro.json",
+  "paths": {
+    "pretrain_save_dir": "outputs/pretrain/absolute",
+    "pretrained_transformer_dir": "outputs/pretrain/no4d-abl-abs-3500",
+    "rounds": "outputs/absolute/rounds",
+    "manifests": "outputs/absolute/manifests"
+  },
+  "model": {
+    "experiment_config": "src/wan_va/experiment_configs/absolute.json",
+    "action_representation": "absolute"
+  }
+}
