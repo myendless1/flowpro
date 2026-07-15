@@ -48,7 +48,7 @@ def test_reset_gate_requires_a_release_before_new_press(capsys):
 
     assert _wait_for_a_reset(controls, lambda: False, 0.0, 3) is True
     assert controls.poll_count == 4
-    assert "Press A to move the robot" in capsys.readouterr().out
+    assert "Press A to raise both arms" in capsys.readouterr().out
 
 
 def test_policy_start_gate_requires_a_release_before_new_press(capsys):

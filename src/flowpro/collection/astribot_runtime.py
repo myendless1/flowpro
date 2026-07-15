@@ -50,7 +50,7 @@ class AstribotRuntimeConfig:
     use_xyzw: bool = False
     camera_timeout: float = 0.3
     image_from_s1_topic: bool = False
-    max_translation_step_m: float = 0.04
+    max_translation_step_m: float = 0.06
     max_rotation_step_deg: float = 15.0
     takeover_max_translation_step_m: float = 0.01
     takeover_max_rotation_step_deg: float = 2.5
@@ -59,6 +59,8 @@ class AstribotRuntimeConfig:
     policy_waypoint_duration: float = 0.1
     init_joint_action: list[list[float]] = field(default_factory=default_init_joint_action)
     initial_joint_duration: float = 4.0
+    reset_prelift_height_m: float = 0.10
+    reset_prelift_duration: float = 1.0
     reset_to_initial_on_startup: bool = True
     left_xyz_low: tuple[float, float, float] | None = None
     left_xyz_high: tuple[float, float, float] | None = None
@@ -106,8 +108,61 @@ class AstribotRobotIO:
             duration=self.config.initial_joint_duration, use_wbc=False,
         )
 
+    def _raise_current_arms_before_initial_reset(self) -> None:
+        lift_height = float(self.config.reset_prelift_height_m)
+        if lift_height <= 0.0:
+            return
+
+        duration = max(0.0, float(self.config.reset_prelift_duration))
+        current_action = self.state_action16()
+        lifted_action = current_action.copy()
+        lifted_action[2] += lift_height
+        lifted_action[10] += lift_height
+        arm_poses, grippers = action16_to_sdk_commands(
+            lifted_action,
+            use_xyzw=self.config.use_xyzw,
+        )
+        names = [
+            self.robot.arm_left_name,
+            self.robot.effector_left_name,
+            self.robot.arm_right_name,
+            self.robot.effector_right_name,
+        ]
+        commands = [arm_poses[0], grippers[0], arm_poses[1], grippers[1]]
+        print(
+            "Raising Astribot arms before initial-pose reset: "
+            f"left_z {float(current_action[2]):.3f}->{float(lifted_action[2]):.3f}, "
+            f"right_z {float(current_action[10]):.3f}->{float(lifted_action[10]):.3f}, "
+            f"duration={duration:.3f}s.",
+            flush=True,
+        )
+        if hasattr(self.robot, "move_cartesian_pose"):
+            self.robot.move_cartesian_pose(
+                names,
+                commands,
+                duration=duration,
+                use_wbc=False,
+                add_default_torso=False,
+            )
+            return
+        if not hasattr(self.robot, "set_different_type_command"):
+            raise RuntimeError(
+                "Astribot SDK must provide a mixed-command API for the "
+                "pre-reset arm lift."
+            )
+        self.robot.set_different_type_command(
+            names,
+            ["cartesian", "joints", "cartesian", "joints"],
+            commands,
+            control_way=self.config.control_way,
+            use_wbc=False,
+        )
+        if duration > 0.0:
+            time.sleep(duration)
+
     def move_to_initial_pose(self) -> None:
-        """Move all non-chassis joints home and rebase Cartesian control."""
+        """Raise both arms, move non-chassis joints home, and rebase control."""
+        self._raise_current_arms_before_initial_reset()
         self._move_to_initial_joint_pose()
         measured = self.state_action16()
         self.reset_history(measured)

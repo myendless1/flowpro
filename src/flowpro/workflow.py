@@ -116,12 +116,15 @@ def collect(cfg, round_id, dry_run):
          "--video-guidance-scale",str(s.get("video_guidance_scale",1)),
          "--action-guidance-scale",str(s.get("action_guidance_scale",1)),
          "--action-representation",str(cfg.section("model").get("action_representation","delta")),
+         "--max-translation-step-m",str(s.get("max_translation_step_m",0.06)),
          "--takeover-max-translation-step-m",str(s.get("takeover_max_translation_step_m",0.01)),
          "--takeover-max-rotation-step-deg",str(s.get("takeover_max_rotation_step_deg",2.5)),
          "--takeover-max-gripper-step",str(s.get("takeover_max_gripper_step",0.02)),
          "--gripper-trigger-threshold",str(s.get("gripper_trigger_threshold",0.2)),
          "--first-policy-waypoint-duration",str(s.get("first_policy_waypoint_duration",0.6)),
-         "--policy-waypoint-duration",str(s.get("policy_waypoint_duration",0.1))]
+         "--policy-waypoint-duration",str(s.get("policy_waypoint_duration",0.1)),
+         "--reset-prelift-height-m",str(s.get("reset_prelift_height_m",0.10)),
+         "--reset-prelift-duration",str(s.get("reset_prelift_duration",1.0))]
     if int(s.get("target_pairs",0)) > 0:
         cmd.extend(["--target-pairs",str(s["target_pairs"])])
     if s.get("sdk_root"):

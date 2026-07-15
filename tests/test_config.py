@@ -24,6 +24,37 @@ def test_mode_configs_inherit_common_settings_and_isolate_outputs():
     assert delta.path_for("paths.rounds") != absolute.path_for("paths.rounds")
 
 
+def test_absolute_rl_config_only_replaces_inference_checkpoint():
+    absolute = load_config("configs/flowpro.absolute.json")
+    absolute_rl = load_config("configs/flowpro.absolute-rl.json")
+
+    assert absolute_rl.section("model") == absolute.section("model")
+    assert absolute_rl.section("collection") == absolute.section("collection")
+    assert absolute_rl.path_for("paths.rounds") == absolute.path_for("paths.rounds")
+    assert absolute_rl.path_for("paths.manifests") == absolute.path_for("paths.manifests")
+    assert absolute_rl.path_for("paths.pretrained_transformer_dir") == (
+        PROJECT_ROOT / "outputs/rl-finetune/no4d-abl-abs-rl"
+    )
+    assert absolute_rl.section("inference")["checkpoint_source"] == "pretrained"
+    assert _inference_checkpoint(absolute_rl, 10) == absolute_rl.path_for(
+        "paths.pretrained_transformer_dir"
+    )
+
+
+def test_absolute_centrifuge_config_only_replaces_task_prompt():
+    absolute = load_config("configs/flowpro.absolute.json")
+    centrifuge = load_config("configs/flowpro.absolute.centrifuge.json")
+
+    assert centrifuge.section("model") == absolute.section("model")
+    assert centrifuge.section("inference") == absolute.section("inference")
+    assert centrifuge.path_for("paths.pretrained_transformer_dir") == (
+        absolute.path_for("paths.pretrained_transformer_dir")
+    )
+    assert centrifuge.section("collection")["prompt"] == (
+        "pick up the plate and put it on centrifuge"
+    )
+
+
 def test_later_round_without_rpro_checkpoint_falls_back_to_mode_pretrained(tmp_path, capsys):
     config_path = tmp_path / "absolute.json"
     config_path.write_text(json.dumps({

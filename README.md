@@ -68,7 +68,7 @@ cd /home/xddex05/repo/flowpro
 
 真实机器人采集按 episode 门控执行：
 
-1. 终端提示后按 Quest 右手柄 A，机器人移动到配置的 `init_joint_action` 初始位姿。
+1. 终端提示后按 Quest 右手柄 A，机器人先保持当前姿态将双臂末端沿 chassis Z 轴上抬 `collection.reset_prelift_height_m`（默认 0.10 m），再移动到配置的 `init_joint_action` 初始位姿。
 2. 整理任务场景，松开 A 后再次按 A，开始执行第一个策略 action chunk。
 3. 每个 chunk 完成后进入按键等待：短按 A 执行下一个 chunk，长按 A 至少 2 秒结束本轮，按 B 回退刚完成的 chunk 并进入接管。
 4. 接管状态下按住 middle trigger 控制机器人，index trigger 在 `collection.gripper_trigger_threshold` 死区后连续控制夹爪，并按 10Hz 记录实测 state delta 和图像；夹爪每个控制 tick 的最大变化由 `collection.takeover_max_gripper_step` 限制。录到至少一段 correction 后，短按或长按 A 会保存偏好对并结束本轮。按 B 会丢弃当前 loser/winner、不保存也不计入 `collection.target_pairs`，随后保持相同 episode 编号并重新采集这条正负样本。如果回退后发现已经没有必要录制，或任务进入不可能完成的状态，可以不按 middle 直接按 A，本轮会结束但不会保存偏好对、也不会计入 `collection.target_pairs`。
@@ -131,6 +131,13 @@ python -m flowpro.cli.collect --output /tmp/flowpro-pairs --fake --fake-pairs 2 
 ./scripts/00_validate.sh --config configs/flowpro.absolute.json --hardware
 ./scripts/02_inference.sh --config configs/flowpro.absolute.json --round 10
 ./scripts/03_collect_preferences.sh --config configs/flowpro.absolute.json --round 10
+
+# Absolute mode, centrifuge task
+./scripts/03_collect_preferences.sh --config configs/flowpro.absolute.centrifuge.json --round 10
+
+# Absolute mode with the external RL-finetuned transformer
+./scripts/02_inference.sh --config configs/flowpro.absolute-rl.json --round 10
+./scripts/03_collect_preferences.sh --config configs/flowpro.absolute-rl.json --round 10
 ```
 
 同一轮的 `augment`、`offline-rl`、`round` 和 `all` 必须继续传入同一份模式配置。未指定 `--config` 时仍默认使用 `configs/flowpro.json`，其行为与 delta 模式兼容；建议实机流程显式选择上述子配置。

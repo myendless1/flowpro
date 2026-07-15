@@ -49,6 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--video-guidance-scale", type=float, default=1.0)
     p.add_argument("--action-guidance-scale", type=float, default=1.0)
     p.add_argument("--action-representation", choices=("absolute", "delta"), default="delta")
+    p.add_argument("--max-translation-step-m", type=float, default=.06)
     p.add_argument("--takeover-max-translation-step-m", type=float, default=.01)
     p.add_argument("--takeover-max-rotation-step-deg", type=float, default=2.5)
     p.add_argument("--takeover-max-gripper-step", type=float, default=.02)
@@ -62,6 +63,8 @@ def _parser() -> argparse.ArgumentParser:
         type=_init_joint_action,
         help="JSON six-group target: torso, left arm, left gripper, right arm, right gripper, head",
     )
+    p.add_argument("--reset-prelift-height-m", type=float, default=.10)
+    p.add_argument("--reset-prelift-duration", type=float, default=1.0)
     p.add_argument("--left-xyz-low", type=float, nargs=3)
     p.add_argument("--left-xyz-high", type=float, nargs=3)
     p.add_argument("--right-xyz-low", type=float, nargs=3)
@@ -102,7 +105,8 @@ def _wait_for_a_reset(
     episode: int,
 ) -> bool:
     print(
-        f"[Episode {episode}] Press A to move the robot to the initial pose.",
+        f"[Episode {episode}] Press A to raise both arms, then move the robot "
+        "to the initial pose.",
         flush=True,
     )
     released = False
@@ -192,7 +196,10 @@ def main() -> None:
         sdk_root=args.sdk_root or AstribotRuntimeConfig.sdk_root,
         sdk_frequency=args.takeover_rate_hz,
         init_joint_action=args.init_joint_action or AstribotRuntimeConfig().init_joint_action,
+        reset_prelift_height_m=args.reset_prelift_height_m,
+        reset_prelift_duration=args.reset_prelift_duration,
         reset_to_initial_on_startup=False,
+        max_translation_step_m=args.max_translation_step_m,
         left_xyz_low=args.left_xyz_low, left_xyz_high=args.left_xyz_high,
         right_xyz_low=args.right_xyz_low, right_xyz_high=args.right_xyz_high,
         right_min_z=args.right_min_z,

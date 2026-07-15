@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from astribot_env.quest_intervention import index_trigger_to_gripper_action
 
@@ -138,6 +139,62 @@ def test_real_robot_adapter_submits_eef_and_grippers_in_one_mixed_command():
     assert kwargs == {"control_way": "filter", "use_wbc": False}
 
 
+def test_initial_pose_reset_lifts_both_arms_before_joint_motion():
+    class RecordingRobot:
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+        whole_body_names = [
+            "chassis", arm_left_name, effector_left_name, arm_right_name,
+            effector_right_name, "head",
+        ]
+
+        def __init__(self):
+            self.calls = []
+
+        def move_cartesian_pose(self, names, commands, **kwargs):
+            self.calls.append(("lift", names, commands, kwargs))
+
+        def move_joints_position(self, names, target, **kwargs):
+            self.calls.append(("home", names, target, kwargs))
+
+    initial = _pose16()
+    initial[[2, 10]] = [0.72, 0.81]
+    initial[[7, 15]] = [0.2, 0.8]
+    measured_after_reset = initial.copy()
+
+    adapter = AstribotRobotIO.__new__(AstribotRobotIO)
+    adapter.config = AstribotRuntimeConfig(
+        reset_prelift_height_m=0.10,
+        reset_prelift_duration=1.25,
+        right_min_z=None,
+    )
+    adapter.robot = RecordingRobot()
+    adapter.action_history = deque()
+    adapter.observation_history = deque()
+    adapter._policy_chunk_count = 4
+    states = iter([initial.copy(), measured_after_reset.copy()])
+    adapter.state_action16 = lambda: next(states)
+
+    adapter.move_to_initial_pose()
+
+    assert [call[0] for call in adapter.robot.calls] == ["lift", "home"]
+    _, names, commands, kwargs = adapter.robot.calls[0]
+    assert names == ["left_arm", "left_gripper", "right_arm", "right_gripper"]
+    np.testing.assert_allclose(commands[0][2], 0.82, atol=1e-7)
+    np.testing.assert_allclose(commands[2][2], 0.91, atol=1e-7)
+    np.testing.assert_allclose(commands[1], [80.0], atol=1e-7)
+    np.testing.assert_allclose(commands[3], [20.0], atol=1e-7)
+    assert kwargs == {
+        "duration": 1.25,
+        "use_wbc": False,
+        "add_default_torso": False,
+    }
+    np.testing.assert_allclose(adapter.command_target16(), measured_after_reset)
+    assert adapter._policy_chunk_count == 0
+
+
 def test_right_only_takeover_sends_a_fixed_left_target_in_complete_mixed_command():
     class RecordingRobot:
         arm_left_name = "left_arm"
@@ -248,6 +305,21 @@ def test_real_robot_adapter_clamps_a_tiny_right_arm_min_z_undershoot():
     target = robot._delta_to_target(_pose16())
 
     assert target[10] >= 0.862
+
+
+def test_policy_translation_safety_limit_is_six_centimeters():
+    robot = AstribotRobotIO.__new__(AstribotRobotIO)
+    robot.config = AstribotRuntimeConfig(right_min_z=None)
+    reference = _pose16()
+
+    within_limit = reference.copy()
+    within_limit[8] += 0.05
+    robot._validate_step(robot._absolute_to_delta(reference, within_limit), within_limit)
+
+    over_limit = reference.copy()
+    over_limit[8] += 0.061
+    with pytest.raises(ValueError, match="Unsafe Cartesian step"):
+        robot._validate_step(robot._absolute_to_delta(reference, over_limit), over_limit)
 
 
 def test_delta_target_uses_the_last_sent_target_not_measured_robot_pose():
