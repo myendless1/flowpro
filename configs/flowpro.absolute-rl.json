@@ -1,0 +1,9 @@
+{
+  "base_config": "flowpro.absolute.json",
+  "paths": {
+    "pretrained_transformer_dir": "outputs/rl-finetune/no4d-abl-abs-rl"
+  },
+  "inference": {
+    "checkpoint_source": "pretrained"
+  }
+}

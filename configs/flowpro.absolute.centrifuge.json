@@ -1,0 +1,6 @@
+{
+  "base_config": "flowpro.absolute.json",
+  "collection": {
+    "prompt": "pick up the plate and put it on centrifuge"
+  }
+}
