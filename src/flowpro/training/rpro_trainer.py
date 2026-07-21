@@ -200,14 +200,23 @@ class RPROTrainerMixin:
         loser = copy.deepcopy(winner)
         action_w = batch["actions"]
         action_l = batch["loser_actions"]
-        # FlowMatchScheduler target is noise - clean action.
+        # FlowMatchScheduler target is noise - clean action; winner targets are
+        # already masked, so this reconstructs the true noise in valid regions.
         noise = winner["action_dict"]["targets"] + action_w
         timesteps = winner["action_dict"]["timesteps"]
-        loser["action_dict"]["value"] = self.train_scheduler_action.add_noise(
-            action_l, noise, timesteps, t_dim=2
+        # Mirror the winner's _add_noise masking so the loser trajectory the
+        # transformer actually consumes is prepared identically. The transformer
+        # reads action_dict["noisy_latents"] (modules/model.py); writing any
+        # other key would silently leave the loser running on the winner's
+        # noised action and break the contrastive objective.
+        mask = winner["action_dict"]["actions_mask"].to(action_l.dtype)
+        loser["action_dict"]["noisy_latents"] = (
+            self.train_scheduler_action.add_noise(action_l, noise, timesteps, t_dim=2)
+            * mask
         )
-        loser["action_dict"]["targets"] = self.train_scheduler_action.training_target(
-            action_l, noise, timesteps
+        loser["action_dict"]["targets"] = (
+            self.train_scheduler_action.training_target(action_l, noise, timesteps)
+            * mask
         )
         return winner, loser
 

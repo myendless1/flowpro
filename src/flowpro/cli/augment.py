@@ -14,7 +14,8 @@ def main():
     p.add_argument("--config",required=True); p.add_argument("--round",type=int,required=True); a=p.parse_args()
     cfg=load_config(a.config); c=InterpolationConfig(**cfg.section("augmentation")); source=PairStore(a.input)
     out=Path(a.output); out.mkdir(parents=True,exist_ok=True); count=0
-    for pair_dir in sorted(Path(a.input).iterdir() if Path(a.input).exists() else []):
+    input_root = Path(a.input).resolve()
+    for pair_dir in sorted(input_root.iterdir() if input_root.exists() else []):
         if not pair_dir.is_dir() or not (pair_dir/"metadata.json").exists(): continue
         for i,sample in enumerate(augment_pair(source.load(pair_dir),c)):
             observation, observation_arrays = _split_arrays(sample.observation, "observation")

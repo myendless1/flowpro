@@ -569,7 +569,7 @@ def test_policy_steps_preserve_wbc_waypoints_and_chunk_durations():
     assert adapter._policy_chunk_count == 1
 
 
-def test_policy_chunk_uses_four_overlapping_nine_point_waypoint_batches():
+def test_policy_chunk_uses_four_eight_point_waypoint_batches():
     class WaypointRobot:
         torso_name = "torso"
         arm_left_name = "left_arm"
@@ -600,13 +600,17 @@ def test_policy_chunk_uses_four_overlapping_nine_point_waypoint_batches():
     result = adapter.execute_policy_waypoint_batches(actions, batch_size=8)
 
     assert len(adapter.robot.calls) == 4
-    assert all(len(waypoints) == 9 for waypoints, _, _ in adapter.robot.calls)
-    assert all(len(times) == 9 and times[0] == 0.0
+    # Each batch submits its 8 target waypoints only. The SDK internally
+    # prepends the current robot pose at t=0, so time_list must start at the
+    # first positive duration (no explicit t=0 anchor) to keep the interpolation
+    # timestamps strictly increasing.
+    assert all(len(waypoints) == 8 for waypoints, _, _ in adapter.robot.calls)
+    assert all(len(times) == 8 and times[0] > 0.0
                for _, times, _ in adapter.robot.calls)
-    np.testing.assert_allclose(adapter.robot.calls[0][1], [0.0, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3])
-    for previous, current in zip(adapter.robot.calls, adapter.robot.calls[1:]):
-        assert current[0][0] == previous[0][-1]
-        np.testing.assert_allclose(current[1], np.arange(9) * 0.1)
+    # First chunk's first waypoint uses the longer first_policy_waypoint_duration.
+    np.testing.assert_allclose(adapter.robot.calls[0][1], [0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3])
+    for _, times, _ in adapter.robot.calls[1:]:
+        np.testing.assert_allclose(times, np.arange(1, 9) * 0.1)
     assert len(adapter.action_history) == 32
     assert result["targets"].shape == (32, 16)
 
