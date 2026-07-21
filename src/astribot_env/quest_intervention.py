@@ -113,12 +113,6 @@ def _matrix_to_quat_xyzw(matrix: np.ndarray) -> np.ndarray:
     return _normalize_quat_xyzw(quat)
 
 
-def project_quat_to_vertical_roll_xyzw(quat_xyzw: Any) -> np.ndarray:
-    quat = _normalize_quat_xyzw(quat_xyzw)
-    projected = np.asarray([0.0, 0.0, quat[2], quat[3]], dtype=np.float64)
-    return _normalize_quat_xyzw(projected).astype(np.float32)
-
-
 def webxr_aligned_quat_to_robot(quat_xyzw: Any) -> np.ndarray:
     rotation = WEBXR_ALIGNED_TO_ROBOT @ _quat_to_matrix_xyzw(quat_xyzw) @ WEBXR_ALIGNED_TO_ROBOT.T
     return _matrix_to_quat_xyzw(rotation).astype(np.float32)
@@ -170,7 +164,6 @@ class QuestResidualIntervention:
         residual_rotation_scale: float,
         residual_gripper_deadband: float = 0.5,
         rotation_gain: float = 1.0,
-        rotation_mode: str = "full",
         timeout: float = 0.05,
         episode_button_hand: str = "right",
         success_button_index: int = 4,
@@ -187,12 +180,6 @@ class QuestResidualIntervention:
         self.residual_rotation_scale = float(residual_rotation_scale)
         self.residual_gripper_deadband = float(residual_gripper_deadband)
         self.rotation_gain = float(rotation_gain)
-        self.rotation_mode = str(rotation_mode).strip().lower() or "full"
-        if self.rotation_mode not in {"full", "vertical_roll_only"}:
-            raise ValueError(
-                "Quest rotation_mode must be 'full' or 'vertical_roll_only', "
-                f"got {self.rotation_mode!r}"
-            )
         self.timeout = float(timeout)
         self.episode_button_hand = episode_button_hand
         self.success_button_index = int(success_button_index)
@@ -256,13 +243,7 @@ class QuestResidualIntervention:
             aligned = hand_state.get("aligned", {})
             position = np.asarray(aligned.get("position", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(3)
             quat = webxr_aligned_quat_to_robot(aligned.get("quaternion", [0.0, 0.0, 0.0, 1.0]))
-            if self.rotation_mode == "vertical_roll_only":
-                quat = project_quat_to_vertical_roll_xyzw(quat)
-            controller_quat_xyzw = (
-                quest_controller_quat_to_robot_target(quat)
-                if self.rotation_mode == "full"
-                else quat
-            )
+            controller_quat_xyzw = quest_controller_quat_to_robot_target(quat)
             middle = float(hand_state.get("middle", 0.0))
             index = float(hand_state.get("index", 0.0))
             active = middle >= self.trigger_threshold
@@ -315,7 +296,6 @@ class QuestResidualIntervention:
                     "scaled_rotvec": scaled_rotvec.tolist(),
                     "absolute_rotvec": absolute_rotvec.tolist(),
                     "rotation_gain": self.rotation_gain,
-                    "rotation_mode": self.rotation_mode,
                 }
             else:
                 anchor.active = False

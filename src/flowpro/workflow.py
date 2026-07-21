@@ -113,6 +113,8 @@ def collect(cfg, round_id, dry_run):
          "--prompt",str(s.get("prompt","perform the task")),"--replan-steps",str(s.get("replan_steps",8)),
          "--state-history-len",str(cfg.section("inference")["state_history_len"]),
          "--obs-history-len",str(s.get("obs_history_len",9)),
+         "--camera-sync-slop-s",str(s.get("camera_sync_slop_s",0.05)),
+         "--camera-sync-rate-hz",str(s.get("camera_sync_rate_hz",40)),
          "--video-guidance-scale",str(s.get("video_guidance_scale",1)),
          "--action-guidance-scale",str(s.get("action_guidance_scale",1)),
          "--action-representation",str(cfg.section("model").get("action_representation","delta")),
@@ -120,9 +122,13 @@ def collect(cfg, round_id, dry_run):
          "--takeover-max-translation-step-m",str(s.get("takeover_max_translation_step_m",0.01)),
          "--takeover-max-rotation-step-deg",str(s.get("takeover_max_rotation_step_deg",2.5)),
          "--takeover-max-gripper-step",str(s.get("takeover_max_gripper_step",0.02)),
+         "--right-gripper-target-angle-deg",str(s.get("right_gripper_target_angle_deg",45.0)),
+         "--right-gripper-ray-axis",str(s.get("right_gripper_ray_axis","+z")),
+         "--right-gripper-level-axis",str(s.get("right_gripper_level_axis","+x")),
          "--gripper-trigger-threshold",str(s.get("gripper_trigger_threshold",0.2)),
          "--first-policy-waypoint-duration",str(s.get("first_policy_waypoint_duration",0.6)),
          "--policy-waypoint-duration",str(s.get("policy_waypoint_duration",0.1)),
+         "--policy-waypoint-batch-actions",str(s.get("policy_waypoint_batch_actions",8)),
          "--reset-prelift-height-m",str(s.get("reset_prelift_height_m",0.10)),
          "--reset-prelift-duration",str(s.get("reset_prelift_duration",1.0))]
     if int(s.get("target_pairs",0)) > 0:
@@ -131,8 +137,16 @@ def collect(cfg, round_id, dry_run):
         cmd.extend(["--sdk-root",str(Path(s["sdk_root"]).expanduser())])
     if s.get("init_joint_action") is not None:
         cmd.extend(["--init-joint-action", json.dumps(s["init_joint_action"], separators=(",", ":"))])
+    if bool(s.get("image_from_s1_topic", True)):
+        cmd.append("--image-from-s1-topic")
+    else:
+        cmd.append("--sdk-image-polling")
     if not bool(s.get("policy_control_left_arm", True)):
         cmd.append("--disable-policy-left-arm")
+    if not bool(s.get("right_gripper_angle_constraint_during_takeover", True)):
+        cmd.append("--disable-right-gripper-angle-constraint-during-takeover")
+    if not bool(s.get("right_gripper_twist_level_constraint", True)):
+        cmd.append("--disable-right-gripper-twist-level-constraint")
     for key, flag in (("left_xyz_low","--left-xyz-low"),("left_xyz_high","--left-xyz-high"),
                       ("right_xyz_low","--right-xyz-low"),("right_xyz_high","--right-xyz-high")):
         if s.get(key) is not None:

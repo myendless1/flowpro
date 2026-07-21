@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import threading
 import time
 from typing import Any
 
@@ -27,15 +28,24 @@ class RGBDReader:
         camera_timeout: float = 0.3,
         cameras_info: dict[str, Any] | None = None,
         use_topic: bool = False,
+        sync_slop_s: float = 0.05,
+        sync_rate_hz: float = 40.0,
     ) -> None:
         self.astribot = astribot
         self.camera_timeout = float(camera_timeout)
         self.use_topic = bool(use_topic)
+        self.sync_slop_s = float(sync_slop_s)
+        self.sync_min_interval_s = 1.0 / max(float(sync_rate_hz), 1e-6)
         self.use_sdk_callback = False
+        self._lock = threading.Lock()
         self._images = {"Bolt": None, "left_D405": None, "right_D405": None}
         self._times = {"Bolt": 0.0, "left_D405": 0.0, "right_D405": 0.0}
+        self._capture_info: dict[str, Any] = {}
+        self._subscribers = []
+        self._synchronizer = None
 
         if self.use_topic:
+            self.astribot.activate_camera(cameras_info or {})
             self._init_ros_topics()
         else:
             self.astribot.activate_camera(cameras_info or {})
@@ -45,14 +55,61 @@ class RGBDReader:
 
     def _init_ros_topics(self) -> None:
         try:
-            import rospy
+            import message_filters
             from sensor_msgs.msg import CompressedImage
         except ModuleNotFoundError as exc:
-            raise RuntimeError("ROS topic camera mode requires rospy and sensor_msgs.") from exc
+            raise RuntimeError(
+                "ROS topic camera mode requires message_filters and sensor_msgs."
+            ) from exc
 
-        rospy.Subscriber("/astribot_camera/head_rgbd/color_compress/compressed", CompressedImage, self._head_callback)
-        rospy.Subscriber("/astribot_camera/left_wrist_rgbd/color_compress/compressed", CompressedImage, self._left_callback)
-        rospy.Subscriber("/astribot_camera/right_wrist_rgbd/color_compress/compressed", CompressedImage, self._right_callback)
+        topics = (
+            "/astribot_camera/head_rgbd/color_compress/compressed",
+            "/astribot_camera/left_wrist_rgbd/color_compress/compressed",
+            "/astribot_camera/right_wrist_rgbd/color_compress/compressed",
+        )
+        self._subscribers = [
+            message_filters.Subscriber(topic, CompressedImage)
+            for topic in topics
+        ]
+        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+            self._subscribers,
+            queue_size=20,
+            slop=self.sync_slop_s,
+            allow_headerless=False,
+        )
+        self._synchronizer.registerCallback(self._synced_camera_callback)
+
+    def _synced_camera_callback(self, head_msg: Any, left_msg: Any, right_msg: Any) -> None:
+        messages = (head_msg, left_msg, right_msg)
+        stamps = [float(msg.header.stamp.to_sec()) for msg in messages]
+        image_timestamp = max(stamps)
+        with self._lock:
+            previous_timestamp = self._capture_info.get("image_timestamp")
+        if (
+            previous_timestamp is not None
+            and image_timestamp - float(previous_timestamp) < self.sync_min_interval_s
+        ):
+            return
+        images = {
+            key: cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+            for key, msg in zip(("Bolt", "left_D405", "right_D405"), messages)
+        }
+        if any(image is None for image in images.values()):
+            return
+        received_at = time.time()
+        with self._lock:
+            self._images.update(images)
+            self._times.update({key: received_at for key in images})
+            self._capture_info = {
+                "image_timestamp": image_timestamp,
+                "camera_timestamps": {
+                    key: stamp
+                    for key, stamp in zip(("cam_high", "cam_left_wrist", "cam_right_wrist"), stamps)
+                },
+                "camera_skew_s": max(stamps) - min(stamps),
+                "image_received_at": received_at,
+                "image_source": "ros_approximate_sync",
+            }
 
     def _register_sdk_camera_callbacks(self) -> None:
         def _cb(topic_name, _msg, _width, _height, array):
@@ -66,16 +123,27 @@ class RGBDReader:
                 "right_wrist_rgbd": "right_D405",
             }.get(camera_name)
             if key is not None:
-                self._images[key] = array
-                self._times[key] = time.time()
+                captured_at = time.time()
+                with self._lock:
+                    self._images[key] = array
+                    self._times[key] = captured_at
+                    self._capture_info = {
+                        "image_timestamp": captured_at,
+                        "camera_skew_s": max(self._times.values()) - min(self._times.values()),
+                        "image_received_at": captured_at,
+                        "image_source": "sdk_callback",
+                    }
 
         self.astribot.register_image_callback("head_rgbd", "color", _cb, need_decode=True)
         self.astribot.register_image_callback("left_wrist_rgbd", "color", _cb, need_decode=True)
         self.astribot.register_image_callback("right_wrist_rgbd", "color", _cb, need_decode=True)
 
     def _set_compressed_image(self, key: str, msg: Any) -> None:
-        self._images[key] = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
-        self._times[key] = time.time()
+        image = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)
+        captured_at = float(msg.header.stamp.to_sec())
+        with self._lock:
+            self._images[key] = image
+            self._times[key] = captured_at
 
     def _head_callback(self, msg: Any) -> None:
         self._set_compressed_image("Bolt", msg)
@@ -87,21 +155,48 @@ class RGBDReader:
         self._set_compressed_image("right_D405", msg)
 
     def get_bgr_images_dict(self) -> dict[str, np.ndarray]:
+        images, _ = self.get_bgr_images_snapshot()
+        return images
+
+    def get_bgr_images_snapshot(self) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         if self.use_topic or self.use_sdk_callback:
-            now = time.time()
-            missing = [
-                key for key in CAMERA_NAME_MAP.values()
-                if self._images[key] is None or now - self._times[key] > self.camera_timeout
-            ]
-            if missing:
-                raise RuntimeError(f"Astribot camera timeout or missing frames: {missing}")
-            return {key: np.asarray(value) for key, value in self._images.items() if value is not None}
+            deadline = time.monotonic() + self.camera_timeout
+            while True:
+                now = time.time()
+                with self._lock:
+                    missing = [
+                        key for key in CAMERA_NAME_MAP.values()
+                        if self._images[key] is None or now - self._times[key] > self.camera_timeout
+                    ]
+                    if not missing:
+                        images = {
+                            key: np.asarray(value)
+                            for key, value in self._images.items()
+                            if value is not None
+                        }
+                        info = dict(self._capture_info)
+                        info["image_age_s"] = max(
+                            0.0, now - float(info.get("image_received_at", now))
+                        )
+                        return images, info
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"Astribot camera timeout or missing synchronized frames: {missing}"
+                    )
+                time.sleep(0.005)
 
         rgb_dict, _, _, _ = self.astribot.get_images_dict()
         missing = [camera for camera in CAMERA_NAME_MAP.values() if camera not in rgb_dict]
         if missing:
             raise RuntimeError(f"Astribot SDK image dict missing cameras: {missing}")
-        return rgb_dict
+        captured_at = time.time()
+        return rgb_dict, {
+            "image_timestamp": captured_at,
+            "camera_skew_s": None,
+            "image_received_at": captured_at,
+            "image_age_s": 0.0,
+            "image_source": "sdk_get_images_dict",
+        }
 
 
 def bgr_to_rgb(image: np.ndarray) -> np.ndarray:

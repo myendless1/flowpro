@@ -54,10 +54,14 @@ def validate_project(cfg: ProjectConfig, *, require_hardware: bool = False) -> l
     horizon = int(augmentation["horizon"])
     rollback = int(collection["rollback_horizon"])
     capacity = int(collection["rollback_capacity"])
+    waypoint_batch_actions = int(collection.get("policy_waypoint_batch_actions", 8))
     checks.append(Check("rollback_vs_chunk", rollback >= horizon,
                         f"rollback_horizon={rollback}, action_horizon={horizon}"))
-    checks.append(Check("rollback_capacity", capacity >= rollback,
-                        f"capacity={capacity}, horizon={rollback}"))
+    checks.append(Check(
+        "rollback_capacity",
+        capacity >= rollback + waypoint_batch_actions,
+        f"capacity={capacity}, required={rollback}+{waypoint_batch_actions}",
+    ))
     try:
         normalize_init_joint_action(collection["init_joint_action"])
     except (KeyError, TypeError, ValueError) as exc:

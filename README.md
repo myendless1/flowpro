@@ -8,12 +8,12 @@
 2. `InterventionCollector` 正常执行策略并保留环形回退缓存。
 3. 操作者按 **B**：冻结最近 `rollback_horizon` 个策略帧作为 loser，并反向重放实际执行的 absolute cmd waypoint。
 4. 回退完成后按住 **middle trigger**：执行并逐 tick 记录星尘/Quest 专家动作作为 winner。
-5. 按 **A**：校验后原子写入 `loser.npz`、`winner.npz`、观测 JSONL 和元数据。未采到接管动作时结束 episode，但不写入 pair。
+5. 回退开始后由后台线程把 loser 和接管期间的 winner 逐帧写入临时 HDF5；按 **A** 时等待剩余队列清空并原子发布 pair，按 **B** 时删除临时数据。未采到接管动作时结束 episode，但不写入 pair。旧 NPZ pair 仍可读取并计入采集进度。
 6. `augment_pair` 对 loser 状态用最近 winner 点、三次 Bézier（位置）、Slerp（姿态）与线性插值（夹爪）生成缺失的 winner chunk；winner 状态构造 identical pair。
 7. `rpro_loss` 实现论文 Eq. 3–6。SFT 和正轨迹样本以 identical pair 进入同一目标；第 1 轮 batch 为 current/SFT=80/20，后续轮为 current/history/SFT=70/15/15。winner/loser/current/reference 共享噪声、flow timestep 和条件输入。
 8. 每轮训练前冻结当前 transformer 为 reference，训练产物保存到 `checkpoints/last/transformer`；下一轮推理通过 `--transformer-source` 加载该权重。
 
-Quest 和 SDK 命令默认以 100 Hz 更新，策略 waypoint、偏好观测和动作样本以 10 Hz 记录；Wan-VA action chunk 为 32 steps。输入模型的 action history 在两个模式下都使用过去实际下发的 absolute cmd action。默认回退 64 个 10 Hz 策略帧，从而在排除最后一个完整 action chunk 后仍能生成负样本。上述频率必须与实际 SFT 数据保持一致。
+Quest 和 SDK 命令默认以 100 Hz 更新，策略动作和偏好样本按 10 Hz 时间表对齐；Wan-VA action chunk 为 32 steps。每个 chunk 分成 4 个独立发送的重叠 waypoint 子轨迹，每组包含上一组末点和 8 个新动作，共 9 个点。输入模型的 action history 在两个模式下都使用过去实际下发的 absolute cmd action。后台观测线程以 40Hz 持续缓存状态和三相机观测，并为每个 action 选择动作开始前最近的一帧。回退队列容量为 72，但 loser 固定只取 B 前最近 64 个实际执行帧。
 
 ## 代码对应
 
@@ -69,12 +69,12 @@ cd /home/xddex05/repo/flowpro
 真实机器人采集按 episode 门控执行：
 
 1. 终端提示后按 Quest 右手柄 A，机器人先保持当前姿态将双臂末端沿 chassis Z 轴上抬 `collection.reset_prelift_height_m`（默认 0.10 m），再移动到配置的 `init_joint_action` 初始位姿。
-2. 整理任务场景，松开 A 后再次按 A，开始执行第一个策略 action chunk。
-3. 每个 chunk 完成后进入按键等待：短按 A 执行下一个 chunk，长按 A 至少 2 秒结束本轮，按 B 回退刚完成的 chunk 并进入接管。
-4. 接管状态下按住 middle trigger 控制机器人，index trigger 在 `collection.gripper_trigger_threshold` 死区后连续控制夹爪，并按 10Hz 记录实测 state delta 和图像；夹爪每个控制 tick 的最大变化由 `collection.takeover_max_gripper_step` 限制。录到至少一段 correction 后，短按或长按 A 会保存偏好对并结束本轮。按 B 会丢弃当前 loser/winner、不保存也不计入 `collection.target_pairs`，随后保持相同 episode 编号并重新采集这条正负样本。如果回退后发现已经没有必要录制，或任务进入不可能完成的状态，可以不按 middle 直接按 A，本轮会结束但不会保存偏好对、也不会计入 `collection.target_pairs`。
+2. 整理任务场景，松开 A 后再次按 A，启动策略。此后 chunk 执行完成会自动推理并执行下一 chunk，不再需要按 A。
+3. 策略主循环以 50Hz 轮询手柄，轨迹线程把每个 32-action chunk 拆成 4 组独立发送的 9-point waypoint 子轨迹。后台观测线程以 40Hz 持续记录真实 state、action history 和三路同步图像。任意时刻按 B 会标记失败时刻，但只允许当前 8-action waypoint batch 完整执行；未发送的后续 batch 会立即丢弃。随后回退 B 前最近 64 步以及 B 后在当前 batch 中执行的剩余动作，并进入接管。B 后动作只参与物理回退，不进入 loser。
+4. 接管状态下按住 middle trigger 控制机器人，index trigger 在 `collection.gripper_trigger_threshold` 死区后连续控制夹爪，并按 10Hz 记录实测 state delta 和图像；记录帧只进入非阻塞队列，由独立线程流式写盘，避免阻塞控制循环。右手柄相邻姿态帧的 delta rotation 会累加到当前右夹爪绝对目标四元数，再约束局部 `+Z` 与水平面成 45 度并绕 `+Z` 补偿 twist，使局部 `+X` 保持水平。夹爪每个控制 tick 的最大变化由 `collection.takeover_max_gripper_step` 限制，右臂最低 Z 保护保持启用。录到至少一段 correction 后按 A 会等待写入队列清空、原子发布偏好对并结束本轮。按 B 会停止 writer、删除临时 loser/winner，随后保持相同 episode 编号并重新采集。如果回退后发现已经没有必要录制，可以不按 middle 直接按 A，本轮会结束但不会保存偏好对。
 5. 下一轮再次按 A 复位，整理场景后再按 A 开始推理。每个 A 门控都会先等待按键释放，因此上一步的 A 不会误触发下一步。
 
-B 只回退当前 Wan-VA action chunk 中已经执行的动作，不再回退整个 episode。
+B 前最近 64 个实际策略 action 构成固定长度 loser；当前 waypoint batch 在 B 后继续执行的动作只追加到回退轨迹，因此物理回退最多包含 72 步。推理、轨迹执行和观测采样分别运行，B 会使尚未返回的旧推理结果失效，并阻止当前 batch 完成后继续发送剩余动作。
 
 `03_collect_preferences.sh` automatically loads ROS/Astribot SDK settings,
 checks the Quest through ADB, applies `adb reverse tcp:8443 tcp:8443`, and
@@ -111,7 +111,7 @@ python -m flowpro.cli.collect --output /tmp/flowpro-pairs --fake --fake-pairs 2 
 
 ## 数据约束与安全
 
-16-D 命令布局固定为 `[left xyz+wxyz+absolute_gripper, right xyz+wxyz+absolute_gripper]`，但预测语义由 `model.action_representation` 决定：`delta` 模式的 xyz/四元数分别表示位移和相对旋转，`absolute` 模式直接表示 cmd target；夹爪在两个模式下始终是绝对值。机器人适配器会把两种预测都转换成 absolute waypoint 后下发 SDK，并将实际下发的 absolute cmd 写入 history。所有模式都执行有限值、单步位移、旋转和工作空间检查；现场仍必须由 Astribot 控制器提供碰撞和急停保护。RGB/状态数组自动写入压缩 NPZ sidecar，JSON 只保存结构和引用。Smooth Interpolation 会排除 loser 的最后一个 action-chunk，避免对接触风险最高的危险尾段做增广。
+16-D 命令布局固定为 `[left xyz+wxyz+absolute_gripper, right xyz+wxyz+absolute_gripper]`，但预测语义由 `model.action_representation` 决定：`delta` 模式的 xyz/四元数分别表示位移和相对旋转，`absolute` 模式直接表示 cmd target；夹爪在两个模式下始终是绝对值。机器人适配器会把两种预测都转换成 absolute waypoint 后下发 SDK，并将实际下发的 absolute cmd 写入 history。所有模式都执行有限值、单步位移、旋转和工作空间检查；现场仍必须由 Astribot 控制器提供碰撞和急停保护。三路压缩图像通过 ROS header timestamp 做近似同步，默认以 40Hz 解码缓存供 10Hz action timestamp 对齐；每帧同时保存相机时间、state 时间、相机间偏差和 state-image 偏差。新采集 pair 的 RGB/状态数组逐帧写入 `trajectories.h5`，同一 observation 内重复引用的数组只保存一次；旧 NPZ sidecar 格式继续兼容。
 
 ## 统一配置与脚本
 
@@ -149,6 +149,6 @@ corresponding interpreter or device.
 
 `scripts/06_run_round.sh` 和 `scripts/07_run_pipeline.sh` 会用同一个训练解释器自动启动推理与采集，因此仍只适用于离线或模拟流程。实机采集必须按上述分阶段 Bash 脚本运行，保证推理服务和 Python 3.8 Astribot collector 分别处于各自环境中。
 
-每一阶段成功后会在当前模式的 `paths.manifests` 写入命令、配置和输出路径记录。采集在新增 `collection.target_pairs` 个有效 pair 后自动进入增广和训练；设为 `0` 时持续到 Ctrl-C。
+每一阶段成功后会在当前模式的 `paths.manifests` 写入命令、配置和输出路径记录。采集会把输出目录中已有的新旧格式有效 pair 都计入进度，并从下一条继续；目录内有效 pair 总数达到 `collection.target_pairs` 后自动进入增广和训练，设为 `0` 时持续到 Ctrl-C。
 
 真实机器人第一次运行前必须先以低速、空工作区验证坐标系、四元数顺序、工作空间、碰撞与急停。软件冒烟测试不能替代硬件验收。

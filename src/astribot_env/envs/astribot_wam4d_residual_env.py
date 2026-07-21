@@ -126,7 +126,6 @@ class AstribotWAM4DResidualEnvConfig:
     quest_gripper_threshold: float = 0.02
     quest_position_scale: float = 1.0
     quest_rotation_gain: float = 1.0
-    quest_rotation_mode: str = "full"
     quest_timeout: float = 0.05
     quest_takeover_release_grace: float = 0.35
     quest_episode_button_hand: str = "right"
@@ -309,7 +308,6 @@ class AstribotWAM4DResidualEnv(gym.Env):
             residual_rotation_scale=self.config.residual_rotation_scale,
             residual_gripper_deadband=self.config.residual_gripper_deadband,
             rotation_gain=self.config.quest_rotation_gain,
-            rotation_mode=self.config.quest_rotation_mode,
             timeout=self.config.quest_timeout,
             episode_button_hand=self.config.quest_episode_button_hand,
             success_button_index=self.config.quest_success_button_index,

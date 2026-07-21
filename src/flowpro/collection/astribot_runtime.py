@@ -8,6 +8,7 @@ state machine and its fake mode remain testable on a development machine.
 
 from collections import deque
 from dataclasses import dataclass, field
+import threading
 import time
 from typing import Any
 
@@ -24,7 +25,9 @@ from astribot_env.utils import (
     ACTION16_DIM,
     action16_to_sdk_commands,
     action_quat_to_sdk_xyzw,
+    apply_right_gripper_orientation_constraint,
     convert_gripper_cmd_value_to_action_value,
+    quat_inverse_xyzw,
     quat_multiply_xyzw,
     rotvec_to_quat_xyzw,
     sdk_xyzw_to_action_quat,
@@ -49,7 +52,9 @@ class AstribotRuntimeConfig:
     control_way: str = "filter"
     use_xyzw: bool = False
     camera_timeout: float = 0.3
-    image_from_s1_topic: bool = False
+    image_from_s1_topic: bool = True
+    camera_sync_slop_s: float = 0.05
+    camera_sync_rate_hz: float = 40.0
     max_translation_step_m: float = 0.06
     max_rotation_step_deg: float = 15.0
     takeover_max_translation_step_m: float = 0.01
@@ -67,6 +72,11 @@ class AstribotRuntimeConfig:
     right_xyz_low: tuple[float, float, float] | None = None
     right_xyz_high: tuple[float, float, float] | None = None
     right_min_z: float | None = 0.862
+    right_gripper_angle_constraint_during_takeover: bool = True
+    right_gripper_target_angle_deg: float = 45.0
+    right_gripper_ray_axis: str = "+z"
+    right_gripper_twist_level_constraint: bool = True
+    right_gripper_level_axis: str = "+x"
     state_history_len: int = 16
     obs_history_len: int = 9
 
@@ -92,14 +102,18 @@ class AstribotRobotIO:
             self.robot,
             camera_timeout=self.config.camera_timeout,
             use_topic=self.config.image_from_s1_topic,
+            sync_slop_s=self.config.camera_sync_slop_s,
+            sync_rate_hz=self.config.camera_sync_rate_hz,
         )
         self.action_history: deque[np.ndarray] = deque(maxlen=self.config.state_history_len)
         self.observation_history: deque[dict[str, Any]] = deque(maxlen=self.config.obs_history_len)
+        self._history_lock = threading.Lock()
         # Delta policy actions are integrated against the target actually sent
         # to the SDK. Both modes expose those absolute cmd targets as history.
         self._last_target = self.state_action16()
         self._takeover_limited_target: np.ndarray | None = None
         self._policy_chunk_count = 0
+        self._policy_torso_pose = None
 
     def _move_to_initial_joint_pose(self) -> None:
         target = normalize_init_joint_action(self.config.init_joint_action)
@@ -130,10 +144,10 @@ class AstribotRobotIO:
         ]
         commands = [arm_poses[0], grippers[0], arm_poses[1], grippers[1]]
         print(
-            "Raising Astribot arms before initial-pose reset: "
-            f"left_z {float(current_action[2]):.3f}->{float(lifted_action[2]):.3f}, "
-            f"right_z {float(current_action[10]):.3f}->{float(lifted_action[10]):.3f}, "
-            f"duration={duration:.3f}s.",
+            "复位到初始位姿前正在抬起 Astribot 双臂："
+            f"左臂 z {float(current_action[2]):.3f}->{float(lifted_action[2]):.3f}，"
+            f"右臂 z {float(current_action[10]):.3f}->{float(lifted_action[10]):.3f}，"
+            f"用时 {duration:.3f} 秒。",
             flush=True,
         )
         if hasattr(self.robot, "move_cartesian_pose"):
@@ -196,21 +210,51 @@ class AstribotRobotIO:
         self._takeover_limited_target = None
 
     def observe(self) -> dict[str, Any]:
+        images, timing = self.rgbd.get_bgr_images_snapshot()
         state = self.state_action16()
-        images = self.rgbd.get_bgr_images_dict()
+        state_timestamp = time.time()
+        timing = dict(timing)
+        timing["state_timestamp"] = state_timestamp
+        image_timestamp = timing.get("image_timestamp")
+        timing["state_image_skew_s"] = (
+            None
+            if image_timestamp is None
+            else abs(state_timestamp - float(image_timestamp))
+        )
         payload = build_wam4d_observation_payload(
             bgr_images=images,
             prompt="",
-            action_history=self.action_history,
-            history_len=self.action_history.maxlen or 16,
+            action_history=self._action_history_snapshot(),
+            history_len=self.config.state_history_len,
         )
-        self.observation_history.append(payload)
+        with self._history_lock:
+            self.observation_history.append(payload)
+            observation_history = list(self.observation_history)
         return {
             "state_action16": state,
             "wam4d": payload,
-            "wam4d_history": list(self.observation_history),
-            "time": time.time(),
+            "wam4d_history": observation_history,
+            "time": state_timestamp,
+            "_flowpro_timing": timing,
         }
+
+    def _action_history_snapshot(self) -> deque[np.ndarray]:
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:
+            return deque(self.action_history, maxlen=getattr(self.action_history, "maxlen", None))
+        with lock:
+            return deque(self.action_history, maxlen=self.action_history.maxlen)
+
+    def _append_action_history(self, targets: np.ndarray) -> None:
+        values = np.asarray(targets, np.float32).reshape(-1, ACTION16_DIM)
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:
+            for target in values:
+                self.action_history.append(target.copy())
+            return
+        with lock:
+            for target in values:
+                self.action_history.append(target.copy())
 
     @staticmethod
     def _quat_angle_deg(a: np.ndarray, b: np.ndarray) -> float:
@@ -380,7 +424,7 @@ class AstribotRobotIO:
         self._validate_step(delta, target)
         self._send_target(target)
         self._last_target = target.copy()
-        self.action_history.append(target.copy())
+        self._append_action_history(target)
 
     def execute_policy_waypoints(self, actions16: np.ndarray) -> np.ndarray:
         """Decode one policy chunk and submit absolute SDK waypoints."""
@@ -390,16 +434,7 @@ class AstribotRobotIO:
         reference = self._last_target.copy()
         targets = []
         for action in actions:
-            if not np.isfinite(action).all():
-                raise ValueError("Robot command contains NaN/Inf")
-            if self._configured_action_representation() == "delta":
-                target = self._delta_to_target(action, reference=reference)
-            else:
-                target = self._delta_to_target(
-                    self._absolute_to_delta(reference, action), reference=reference
-                )
-            delta = self._absolute_to_delta(reference, target)
-            self._validate_step(delta, target)
+            target = self._policy_action_to_target(action, reference=reference)
             targets.append(target)
             reference = target
         targets_array = np.asarray(targets, np.float32)
@@ -415,6 +450,141 @@ class AstribotRobotIO:
         self._policy_chunk_count += 1
         return targets_array
 
+    def execute_policy_step(
+        self,
+        action16: np.ndarray,
+        *,
+        first_in_chunk: bool,
+        last_in_chunk: bool,
+    ) -> np.ndarray:
+        """Execute one policy action as an interruptible one-waypoint trajectory."""
+        reference = self._last_target.copy()
+        target = self._policy_action_to_target(action16, reference=reference)
+        duration = (
+            float(self.config.first_policy_waypoint_duration)
+            if self._policy_chunk_count == 0 and first_in_chunk
+            else float(self.config.policy_waypoint_duration)
+        )
+        self._execute_absolute_waypoint_trajectory(
+            target.reshape(1, ACTION16_DIM),
+            [duration],
+        )
+        if last_in_chunk:
+            self._policy_chunk_count += 1
+        return target.copy()
+
+    def execute_policy_waypoint_batch(
+        self,
+        actions16: np.ndarray,
+        *,
+        first_in_chunk: bool,
+        last_in_chunk: bool,
+    ) -> dict[str, Any]:
+        """Submit one waypoint call containing an anchor and new policy actions."""
+        actions = np.asarray(actions16, np.float32).reshape(-1, ACTION16_DIM)
+        if not len(actions):
+            raise ValueError("策略 waypoint batch 不能为空")
+
+        reference = self._last_target.copy()
+        targets = []
+        starts = []
+        durations = []
+        for index, action in enumerate(actions):
+            starts.append(reference.copy())
+            target = self._policy_action_to_target(action, reference=reference)
+            targets.append(target)
+            durations.append(
+                float(self.config.first_policy_waypoint_duration)
+                if self._policy_chunk_count == 0 and first_in_chunk and index == 0
+                else float(self.config.policy_waypoint_duration)
+            )
+            reference = target
+
+        targets_array = np.asarray(targets, np.float32)
+        starts_array = np.asarray(starts, np.float32)
+        action_start_times = np.empty(len(actions), np.float64)
+        action_arrival_times = np.empty(len(actions), np.float64)
+
+        batch_durations = np.asarray(durations, np.float64)
+        cumulative = np.cumsum(batch_durations)
+        # SDK's move_cartesian_waypoints internally prepends the current robot
+        # state at t=0, so time_list must start at the first positive duration.
+        # Passing an explicit anchor at t=0.0 would produce a duplicate zero
+        # and trigger "x must be strictly increasing" in scipy's cubic spline.
+        submitted_at = self._execute_absolute_waypoint_schedule(
+            targets_array,
+            cumulative.tolist(),
+            history_start_index=0,
+        )
+        action_start_times[:] = submitted_at + np.concatenate(
+            [[0.0], cumulative[:-1]]
+        )
+        action_arrival_times[:] = submitted_at + cumulative
+
+        if last_in_chunk:
+            self._policy_chunk_count += 1
+        return {
+            "targets": targets_array,
+            "start_targets": starts_array,
+            "action_start_times": action_start_times,
+            "action_arrival_times": action_arrival_times,
+            "finished_at": time.time(),
+        }
+
+    def execute_policy_waypoint_batches(
+        self,
+        actions16: np.ndarray,
+        *,
+        batch_size: int = 8,
+    ) -> dict[str, Any]:
+        """Compatibility helper that executes a full chunk batch by batch."""
+        actions = np.asarray(actions16, np.float32).reshape(-1, ACTION16_DIM)
+        if not len(actions):
+            raise ValueError("策略 waypoint chunk 不能为空")
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise ValueError("waypoint batch_size 必须大于 0")
+        results = []
+        for begin in range(0, len(actions), batch_size):
+            end = min(begin + batch_size, len(actions))
+            results.append(
+                self.execute_policy_waypoint_batch(
+                    actions[begin:end],
+                    first_in_chunk=begin == 0,
+                    last_in_chunk=end == len(actions),
+                )
+            )
+        combined = {
+            key: np.concatenate([result[key] for result in results], axis=0)
+            for key in (
+                "targets",
+                "start_targets",
+                "action_start_times",
+                "action_arrival_times",
+            )
+        }
+        combined["finished_at"] = float(results[-1]["finished_at"])
+        return combined
+
+    def _policy_action_to_target(
+        self,
+        action16: np.ndarray,
+        *,
+        reference: np.ndarray,
+    ) -> np.ndarray:
+        action = np.asarray(action16, np.float32).reshape(ACTION16_DIM)
+        reference = np.asarray(reference, np.float32).reshape(ACTION16_DIM)
+        if not np.isfinite(action).all():
+            raise ValueError("Robot command contains NaN/Inf")
+        if self._configured_action_representation() == "delta":
+            target = self._delta_to_target(action, reference=reference)
+        else:
+            target = self._delta_to_target(
+                self._absolute_to_delta(reference, action), reference=reference
+            )
+        self._validate_step(self._absolute_to_delta(reference, target), target)
+        return target
+
     def _execute_absolute_waypoint_trajectory(
         self,
         targets16: np.ndarray,
@@ -423,6 +593,30 @@ class AstribotRobotIO:
         targets_array = np.asarray(targets16, np.float32).reshape(-1, ACTION16_DIM)
         if len(targets_array) != len(step_durations) or not len(targets_array):
             raise ValueError("Waypoint targets and durations must have equal non-zero lengths")
+        time_list = []
+        elapsed = 0.0
+        for duration in step_durations:
+            elapsed += float(duration)
+            time_list.append(elapsed)
+        self._execute_absolute_waypoint_schedule(targets_array, time_list)
+
+    def _execute_absolute_waypoint_schedule(
+        self,
+        targets16: np.ndarray,
+        time_list: list[float],
+        *,
+        history_start_index: int = 0,
+    ) -> float:
+        targets_array = np.asarray(targets16, np.float32).reshape(-1, ACTION16_DIM)
+        if len(targets_array) != len(time_list) or not len(targets_array):
+            raise ValueError("Waypoint targets and times must have equal non-zero lengths")
+        times = np.asarray(time_list, np.float64)
+        if np.any(times < 0) or np.any(np.diff(times) < 0):
+            raise ValueError("Waypoint times must be non-negative and monotonic")
+        history_start_index = int(history_start_index)
+        if not 0 <= history_start_index < len(targets_array):
+            raise ValueError("Invalid waypoint history_start_index")
+
         names = [
             self.robot.torso_name,
             self.robot.arm_left_name,
@@ -430,7 +624,10 @@ class AstribotRobotIO:
             self.robot.arm_right_name,
             self.robot.effector_right_name,
         ]
-        torso_pose = self.robot.get_desired_cartesian_pose([self.robot.torso_name])[0]
+        torso_pose = getattr(self, "_policy_torso_pose", None)
+        if torso_pose is None:
+            torso_pose = self.robot.get_desired_cartesian_pose([self.robot.torso_name])[0]
+            self._policy_torso_pose = list(torso_pose)
         waypoints = []
         reference = self._last_target.copy()
         for target in targets_array:
@@ -447,21 +644,17 @@ class AstribotRobotIO:
             ])
             reference = target
 
-        time_list = []
-        elapsed = 0.0
-        for duration in step_durations:
-            elapsed += float(duration)
-            time_list.append(elapsed)
+        submitted_at = time.time()
         self.robot.move_cartesian_waypoints(
             names,
             waypoints,
-            time_list,
+            times.tolist(),
             use_wbc=True,
             add_default_torso=False,
         )
         self._last_target = targets_array[-1].copy()
-        for target in targets_array:
-            self.action_history.append(target.copy())
+        self._append_action_history(targets_array[history_start_index:])
+        return submitted_at
 
     def execute_rollback_waypoints(
         self,
@@ -471,8 +664,20 @@ class AstribotRobotIO:
     ) -> None:
         """Submit a reversed absolute chunk as one continuous SDK trajectory."""
         targets = np.asarray(targets16, np.float32).reshape(-1, ACTION16_DIM)
+        reference = self._last_target.copy()
+        safe_targets = []
+        for target in targets:
+            safe_target = self._delta_to_target(
+                self._absolute_to_delta(reference, target),
+                reference=reference,
+            )
+            safe_targets.append(safe_target)
+            reference = safe_target
         duration = max(float(step_duration_s), 1e-3)
-        self._execute_absolute_waypoint_trajectory(targets, [duration] * len(targets))
+        self._execute_absolute_waypoint_trajectory(
+            np.asarray(safe_targets, np.float32),
+            [duration] * len(safe_targets),
+        )
 
     def execute_absolute(self, action16: np.ndarray) -> None:
         """Send an absolute target and make it the base for subsequent deltas."""
@@ -491,7 +696,7 @@ class AstribotRobotIO:
         self._validate_step(self._absolute_to_delta(reference, target), target)
         self._send_target(target)
         self._last_target = target.copy()
-        self.action_history.append(target.copy())
+        self._append_action_history(target)
 
     @staticmethod
     def _slerp_action_quat(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
@@ -527,8 +732,18 @@ class AstribotRobotIO:
         assert self._takeover_limited_target is not None
         previous = self._takeover_limited_target
         target = np.asarray(action16, np.float32).reshape(ACTION16_DIM).copy()
-        limited = target.copy()
         active = arm_command_mask or {"left": True, "right": True}
+        if active.get("right", False):
+            target = apply_right_gripper_orientation_constraint(
+                target,
+                enabled=self.config.right_gripper_angle_constraint_during_takeover,
+                use_xyzw=self.config.use_xyzw,
+                target_angle_deg=self.config.right_gripper_target_angle_deg,
+                ray_axis=self.config.right_gripper_ray_axis,
+                level_axis=self.config.right_gripper_level_axis,
+                keep_level_axis_horizontal=self.config.right_gripper_twist_level_constraint,
+            )
+        limited = target.copy()
         for hand, off in (("left", 0), ("right", 8)):
             if not active.get(hand, False):
                 limited[off : off + 8] = previous[off : off + 8]
@@ -570,15 +785,23 @@ class AstribotRobotIO:
         self._send_target(limited)
         self._takeover_limited_target = limited.copy()
         self._last_target = limited.copy()
-        self.action_history.append(limited.copy())
+        self._append_action_history(limited)
 
     def reset_history(self, action16: np.ndarray) -> None:
-        self.action_history.clear()
         target = np.asarray(action16, np.float32).reshape(16).copy()
-        self.action_history.append(target)
+        lock = getattr(self, "_history_lock", None)
+        if lock is None:
+            self.action_history.clear()
+            self.action_history.append(target)
+            self.observation_history.clear()
+        else:
+            with lock:
+                self.action_history.clear()
+                self.action_history.append(target)
+                self.observation_history.clear()
         self._last_target = target.copy()
-        self.observation_history.clear()
         self._policy_chunk_count = 0
+        self._policy_torso_pose = None
 
 
 class WanVAPolicy:
@@ -619,11 +842,11 @@ class WanVAPolicy:
         left_xyz = action[0:3]
         right_xyz = action[8:11]
         print(
-            "WAM4D server action "
+            "WAM4D 服务端动作 "
             f"#{self._executed_server_action_count} "
-            f"(de-normalized {self.action_representation} xyz): "
-            f"left=[{left_xyz[0]:+.5f}, {left_xyz[1]:+.5f}, {left_xyz[2]:+.5f}] "
-            f"right=[{right_xyz[0]:+.5f}, {right_xyz[1]:+.5f}, {right_xyz[2]:+.5f}]",
+            f"（反归一化后的 {self.action_representation} xyz）："
+            f"左臂=[{left_xyz[0]:+.5f}, {left_xyz[1]:+.5f}, {left_xyz[2]:+.5f}] "
+            f"右臂=[{right_xyz[0]:+.5f}, {right_xyz[1]:+.5f}, {right_xyz[2]:+.5f}]",
             flush=True,
         )
         if not self.control_left_arm:
@@ -638,7 +861,7 @@ class WanVAPolicy:
                     action[7] = current[7]
             elif current is not None:
                 action[0:8] = current[0:8]
-            print("WAM4D policy: left arm/gripper locked; executing right arm only.", flush=True)
+            print("WAM4D 策略：左臂和左夹爪已锁定，仅执行右臂动作。", flush=True)
         return action
 
     def infer(self, observation: dict[str, Any]) -> np.ndarray:
@@ -676,12 +899,62 @@ class QuestControlSource:
             failure_button_index=button_b_index, episode_button_threshold=0.5,
         )
         self.anchor: np.ndarray | None = None
+        self._right_quest_rotation_xyzw: np.ndarray | None = None
+        self._right_target_rotation_xyzw: np.ndarray | None = None
         self.consecutive_errors = 0
 
     def reset(self) -> None:
         self.quest.reset()
         self.anchor = None
+        self._right_quest_rotation_xyzw = None
+        self._right_target_rotation_xyzw = None
         self.consecutive_errors = 0
+
+    def _current_command16(self) -> np.ndarray:
+        command_target = getattr(self.robot, "command_target16", None)
+        if callable(command_target):
+            return np.asarray(command_target(), np.float32).reshape(ACTION16_DIM).copy()
+        assert self.anchor is not None
+        return self.anchor.copy()
+
+    def _apply_right_rotation_delta(
+        self,
+        target: np.ndarray,
+        cumulative_rotvec: np.ndarray,
+    ) -> None:
+        current_quest_rotation = rotvec_to_quat_xyzw(cumulative_rotvec)
+        previous_quest_rotation = getattr(self, "_right_quest_rotation_xyzw", None)
+        if previous_quest_rotation is None:
+            step_delta = current_quest_rotation
+        else:
+            step_delta = quat_multiply_xyzw(
+                quat_inverse_xyzw(previous_quest_rotation),
+                current_quest_rotation,
+            )
+
+        current_target_rotation = getattr(self, "_right_target_rotation_xyzw", None)
+        if current_target_rotation is None:
+            current_command = self._current_command16()
+            current_target_rotation = action_quat_to_sdk_xyzw(
+                current_command[11:15], use_xyzw=self.robot.config.use_xyzw
+            )
+        desired_rotation = quat_multiply_xyzw(current_target_rotation, step_delta)
+        target[11:15] = sdk_xyzw_to_action_quat(
+            desired_rotation, use_xyzw=self.robot.config.use_xyzw
+        )
+        target[:] = apply_right_gripper_orientation_constraint(
+            target,
+            enabled=self.robot.config.right_gripper_angle_constraint_during_takeover,
+            use_xyzw=self.robot.config.use_xyzw,
+            target_angle_deg=self.robot.config.right_gripper_target_angle_deg,
+            ray_axis=self.robot.config.right_gripper_ray_axis,
+            level_axis=self.robot.config.right_gripper_level_axis,
+            keep_level_axis_horizontal=self.robot.config.right_gripper_twist_level_constraint,
+        )
+        self._right_quest_rotation_xyzw = current_quest_rotation.copy()
+        self._right_target_rotation_xyzw = action_quat_to_sdk_xyzw(
+            target[11:15], use_xyzw=self.robot.config.use_xyzw
+        )
 
     def _expert_action(self, residual: np.ndarray, info: dict[str, Any]) -> np.ndarray:
         if self.anchor is None:
@@ -690,13 +963,23 @@ class QuestControlSource:
         for hand, off, roff in (("left", 0, 0), ("right", 8, 7)):
             hand_info = info.get(hand, {})
             if not hand_info.get("active", False):
+                if hand == "right":
+                    self._right_quest_rotation_xyzw = None
+                    self._right_target_rotation_xyzw = None
                 continue
             delta_xyz = np.asarray(hand_info.get("relative_position", residual[roff:roff+3] * .2))
             delta_rot = np.asarray(hand_info.get("scaled_rotvec", residual[roff+3:roff+6] * np.deg2rad(30)))
             target[off:off+3] = self.anchor[off:off+3] + delta_xyz
-            base_q = action_quat_to_sdk_xyzw(self.anchor[off+3:off+7], use_xyzw=self.robot.config.use_xyzw)
-            target_q = quat_multiply_xyzw(base_q, rotvec_to_quat_xyzw(delta_rot))
-            target[off+3:off+7] = sdk_xyzw_to_action_quat(target_q, use_xyzw=self.robot.config.use_xyzw)
+            if hand == "right":
+                self._apply_right_rotation_delta(target, delta_rot)
+            else:
+                base_q = action_quat_to_sdk_xyzw(
+                    self.anchor[off+3:off+7], use_xyzw=self.robot.config.use_xyzw
+                )
+                target_q = quat_multiply_xyzw(base_q, rotvec_to_quat_xyzw(delta_rot))
+                target[off+3:off+7] = sdk_xyzw_to_action_quat(
+                    target_q, use_xyzw=self.robot.config.use_xyzw
+                )
             if "index" in hand_info:
                 target[off + 7] = index_trigger_to_gripper_action(
                     float(hand_info["index"]), self.quest.gripper_threshold
@@ -722,6 +1005,8 @@ class QuestControlSource:
             }
         if not active:
             self.anchor = None
+            self._right_quest_rotation_xyzw = None
+            self._right_target_rotation_xyzw = None
         return InputState(
             b=bool(buttons.get("failure_value", 0) >= .5),
             a=bool(buttons.get("success_value", 0) >= .5),
@@ -780,6 +1065,69 @@ class FakeAstribotRobotIO:
             self.execute(action)
             targets.append(self.action.copy())
         return np.asarray(targets, np.float32)
+
+    def execute_policy_waypoint_batch(
+        self,
+        actions16: np.ndarray,
+        *,
+        first_in_chunk: bool,
+        last_in_chunk: bool,
+    ) -> dict[str, Any]:
+        actions = np.asarray(actions16, np.float32).reshape(-1, 16)
+        targets = []
+        starts = []
+        started_at = time.time()
+        for action in actions:
+            starts.append(self.action.copy())
+            self.execute(action)
+            targets.append(self.action.copy())
+        offsets = np.arange(len(actions), dtype=np.float64) * 0.1
+        return {
+            "targets": np.asarray(targets, np.float32),
+            "start_targets": np.asarray(starts, np.float32),
+            "action_start_times": started_at + offsets,
+            "action_arrival_times": started_at + offsets + 0.1,
+            "finished_at": time.time(),
+        }
+
+    def execute_policy_waypoint_batches(
+        self,
+        actions16: np.ndarray,
+        *,
+        batch_size: int = 8,
+    ) -> dict[str, Any]:
+        actions = np.asarray(actions16, np.float32).reshape(-1, 16)
+        results = []
+        for begin in range(0, len(actions), int(batch_size)):
+            end = min(begin + int(batch_size), len(actions))
+            results.append(
+                self.execute_policy_waypoint_batch(
+                    actions[begin:end],
+                    first_in_chunk=begin == 0,
+                    last_in_chunk=end == len(actions),
+                )
+            )
+        combined = {
+            key: np.concatenate([result[key] for result in results], axis=0)
+            for key in (
+                "targets",
+                "start_targets",
+                "action_start_times",
+                "action_arrival_times",
+            )
+        }
+        combined["finished_at"] = float(results[-1]["finished_at"])
+        return combined
+
+    def execute_policy_step(
+        self,
+        action16: np.ndarray,
+        *,
+        first_in_chunk: bool,
+        last_in_chunk: bool,
+    ) -> np.ndarray:
+        self.execute(action16)
+        return self.action.copy()
 
     def reset_history(self, action16: np.ndarray) -> None:
         self.action = np.asarray(action16, np.float32).reshape(16).copy()

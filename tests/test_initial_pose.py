@@ -27,4 +27,5 @@ def test_collection_workflow_passes_configured_joint_action(capsys):
 
     command = capsys.readouterr().out
     assert "--init-joint-action" in command
+    assert "--right-gripper-target-angle-deg 45.0" in command
     assert "--init-hdf5" not in command

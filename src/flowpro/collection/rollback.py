@@ -10,8 +10,8 @@ from wan_va.action_representation import relative_pose7
 
 @dataclass
 class RollbackConfig:
-    capacity: int = 200
-    default_horizon: int = 20
+    capacity: int = 72
+    default_horizon: int = 64
     step_interval_s: float = 0.0
 
 
@@ -88,7 +88,9 @@ def frame_start16(frame: Frame):
     observation = frame.observation
     if not isinstance(observation, dict):
         return None
-    state = observation.get("state_action16")
+    state = observation.get("_flowpro_rollback_start16")
+    if state is None:
+        state = observation.get("state_action16")
     if state is None:
         history = observation.get("wam4d", {}).get("observation.state", [])
         if len(history):

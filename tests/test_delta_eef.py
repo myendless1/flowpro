@@ -7,6 +7,13 @@ import numpy as np
 import pytest
 
 from astribot_env.quest_intervention import index_trigger_to_gripper_action
+from astribot_env.utils import (
+    action_quat_to_sdk_xyzw,
+    quat_multiply_xyzw,
+    quat_xyzw_to_matrix,
+    quat_xyzw_to_rotvec,
+    rotvec_to_quat_xyzw,
+)
 
 from flowpro.collection.astribot_runtime import (
     AstribotRobotIO,
@@ -265,6 +272,58 @@ def test_quest_rotation_does_not_modify_takeover_translation():
     )
 
 
+def test_right_quest_rotation_deltas_accumulate_on_current_absolute_target():
+    class Robot:
+        config = AstribotRuntimeConfig(
+            right_min_z=None,
+            right_gripper_angle_constraint_during_takeover=False,
+        )
+
+        def __init__(self):
+            self.command = _pose16()
+            self.command[11:15] = [0.9238795, 0.0, 0.3826834, 0.0]
+
+        def command_target16(self):
+            return self.command.copy()
+
+    source = QuestControlSource.__new__(QuestControlSource)
+    source.robot = Robot()
+    source.anchor = source.robot.command_target16()
+    source._right_quest_rotation_xyzw = None
+    source._right_target_rotation_xyzw = None
+    first_quest_rotation = rotvec_to_quat_xyzw([0.2, 0.0, 0.0])
+    step_rotation = rotvec_to_quat_xyzw([0.0, 0.15, 0.0])
+    second_quest_rotation = quat_multiply_xyzw(first_quest_rotation, step_rotation)
+
+    first = source._expert_action(
+        np.zeros(14, np.float32),
+        {"right": {"active": True, "scaled_rotvec": [0.2, 0.0, 0.0]}},
+    )
+    second = source._expert_action(
+        np.zeros(14, np.float32),
+        {
+            "right": {
+                "active": True,
+                "scaled_rotvec": quat_xyzw_to_rotvec(second_quest_rotation),
+            }
+        },
+    )
+
+    base = action_quat_to_sdk_xyzw(source.robot.command[11:15], use_xyzw=False)
+    first_expected = quat_multiply_xyzw(base, first_quest_rotation)
+    second_expected = quat_multiply_xyzw(first_expected, step_rotation)
+    np.testing.assert_allclose(
+        action_quat_to_sdk_xyzw(first[11:15], use_xyzw=False),
+        first_expected,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        action_quat_to_sdk_xyzw(second[11:15], use_xyzw=False),
+        second_expected,
+        atol=1e-6,
+    )
+
+
 def test_index_trigger_maps_continuously_to_gripper_action():
     np.testing.assert_allclose(index_trigger_to_gripper_action(0.0, 0.2), 1.0)
     np.testing.assert_allclose(index_trigger_to_gripper_action(0.2, 0.2), 1.0)
@@ -378,6 +437,40 @@ def test_takeover_clamps_measured_right_z_below_safety_floor():
     assert sent[-1][10] >= 0.862
 
 
+def test_takeover_constrains_right_gripper_absolute_orientation_and_keeps_min_z():
+    robot = AstribotRobotIO.__new__(AstribotRobotIO)
+    robot.config = AstribotRuntimeConfig(
+        right_min_z=0.862,
+        max_rotation_step_deg=0.0,
+        takeover_max_rotation_step_deg=0.0,
+    )
+    previous = _pose16()
+    previous[10] = 0.9
+    robot._last_target = previous.copy()
+    robot._takeover_limited_target = previous.copy()
+    robot.action_history = deque()
+    sent = []
+    robot._send_target = lambda target, **_kwargs: sent.append(np.asarray(target).copy())
+    target = previous.copy()
+    target[10] = 0.7
+    target[11:15] = [0.8, 0.2, -0.3, 0.45]
+
+    robot.execute_takeover_absolute(
+        target, arm_command_mask={"left": False, "right": True}
+    )
+
+    constrained = sent[-1]
+    rotation = quat_xyzw_to_matrix(
+        action_quat_to_sdk_xyzw(constrained[11:15], use_xyzw=False)
+    )
+    ray = rotation[:, 2]
+    level = rotation[:, 0]
+    ray_angle_deg = np.degrees(np.arcsin(np.clip(abs(float(ray[2])), 0.0, 1.0)))
+    np.testing.assert_allclose(ray_angle_deg, 45.0, atol=1e-5)
+    np.testing.assert_allclose(level[2], 0.0, atol=1e-6)
+    assert constrained[10] >= 0.862
+
+
 def test_takeover_rate_limits_continuous_gripper_target():
     robot = AstribotRobotIO.__new__(AstribotRobotIO)
     robot.config = AstribotRuntimeConfig(
@@ -432,6 +525,123 @@ def test_policy_delta_chunk_is_sent_as_one_absolute_waypoint_trajectory():
     np.testing.assert_allclose(times, [0.6, 0.7])
     np.testing.assert_allclose(targets[:, 8], [0.01, 0.03], atol=1e-7)
     assert kwargs == {"use_wbc": True, "add_default_torso": False}
+
+
+def test_policy_steps_preserve_wbc_waypoints_and_chunk_durations():
+    class WaypointRobot:
+        torso_name = "torso"
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+
+        def __init__(self):
+            self.calls = []
+
+        def get_desired_cartesian_pose(self, names):
+            return [[0, 0, 1, 0, 0, 0, 1]]
+
+        def move_cartesian_waypoints(self, names, waypoints, time_list, **kwargs):
+            self.calls.append((waypoints, time_list, kwargs))
+
+    adapter = AstribotRobotIO.__new__(AstribotRobotIO)
+    adapter.config = AstribotRuntimeConfig(right_min_z=None)
+    adapter.robot = WaypointRobot()
+    adapter._last_target = _pose16()
+    adapter._policy_chunk_count = 0
+    adapter.action_history = deque()
+    first = _pose16(); first[8] = 0.01
+    second = _pose16(); second[8] = 0.02
+
+    target_1 = adapter.execute_policy_step(
+        first, first_in_chunk=True, last_in_chunk=False
+    )
+    target_2 = adapter.execute_policy_step(
+        second, first_in_chunk=False, last_in_chunk=True
+    )
+
+    assert len(adapter.robot.calls) == 2
+    assert adapter.robot.calls[0][1] == [0.6]
+    assert adapter.robot.calls[1][1] == [0.1]
+    assert all(call[2] == {"use_wbc": True, "add_default_torso": False}
+               for call in adapter.robot.calls)
+    np.testing.assert_allclose([target_1[8], target_2[8]], [0.01, 0.03], atol=1e-7)
+    assert adapter._policy_chunk_count == 1
+
+
+def test_policy_chunk_uses_four_overlapping_nine_point_waypoint_batches():
+    class WaypointRobot:
+        torso_name = "torso"
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+
+        def __init__(self):
+            self.calls = []
+
+        def get_desired_cartesian_pose(self, names):
+            return [[0, 0, 1, 0, 0, 0, 1]]
+
+        def move_cartesian_waypoints(self, names, waypoints, time_list, **kwargs):
+            self.calls.append((waypoints, time_list, kwargs))
+
+    adapter = AstribotRobotIO.__new__(AstribotRobotIO)
+    adapter.config = AstribotRuntimeConfig(right_min_z=None)
+    adapter.robot = WaypointRobot()
+    adapter._last_target = _pose16()
+    adapter._policy_chunk_count = 0
+    adapter._policy_torso_pose = None
+    adapter.action_history = deque()
+    adapter.observation_history = deque()
+    actions = np.tile(_pose16(), (32, 1))
+    actions[:, 8] = 0.001
+
+    result = adapter.execute_policy_waypoint_batches(actions, batch_size=8)
+
+    assert len(adapter.robot.calls) == 4
+    assert all(len(waypoints) == 9 for waypoints, _, _ in adapter.robot.calls)
+    assert all(len(times) == 9 and times[0] == 0.0
+               for _, times, _ in adapter.robot.calls)
+    np.testing.assert_allclose(adapter.robot.calls[0][1], [0.0, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3])
+    for previous, current in zip(adapter.robot.calls, adapter.robot.calls[1:]):
+        assert current[0][0] == previous[0][-1]
+        np.testing.assert_allclose(current[1], np.arange(9) * 0.1)
+    assert len(adapter.action_history) == 32
+    assert result["targets"].shape == (32, 16)
+
+
+def test_rollback_clamps_legacy_measured_start_above_right_min_z():
+    class WaypointRobot:
+        torso_name = "torso"
+        arm_left_name = "left_arm"
+        effector_left_name = "left_gripper"
+        arm_right_name = "right_arm"
+        effector_right_name = "right_gripper"
+
+        def __init__(self):
+            self.calls = []
+
+        def get_desired_cartesian_pose(self, names):
+            return [[0, 0, 1, 0, 0, 0, 1]]
+
+        def move_cartesian_waypoints(self, names, waypoints, time_list, **kwargs):
+            self.calls.append((waypoints, time_list, kwargs))
+
+    adapter = AstribotRobotIO.__new__(AstribotRobotIO)
+    adapter.config = AstribotRuntimeConfig(right_min_z=0.862)
+    adapter.robot = WaypointRobot()
+    adapter._last_target = _pose16()
+    adapter._last_target[10] = 0.87
+    adapter._policy_torso_pose = None
+    adapter.action_history = deque()
+    target = adapter._last_target.copy()
+    target[10] = 0.8617
+
+    adapter.execute_rollback_waypoints(target[None], step_duration_s=0.1)
+
+    right_arm_pose = adapter.robot.calls[0][0][-1][3]
+    assert right_arm_pose[2] >= 0.862
 
 
 def test_policy_absolute_chunk_is_sent_without_delta_integration():
@@ -503,9 +713,9 @@ def test_policy_logs_de_normalized_server_delta_xyz_before_execution(capsys):
     policy.infer({"wam4d": {}, "state_action16": _pose16()})
 
     output = capsys.readouterr().out
-    assert "WAM4D server action #1 (de-normalized delta xyz)" in output
-    assert "left=[+0.00000, +0.00000, +0.00000]" in output
-    assert "right=[+0.00000, +0.00000, +0.00000]" in output
+    assert "WAM4D 服务端动作 #1 （反归一化后的 delta xyz）" in output
+    assert "左臂=[+0.00000, +0.00000, +0.00000]" in output
+    assert "右臂=[+0.00000, +0.00000, +0.00000]" in output
 
 
 def test_policy_can_lock_the_left_arm_without_changing_the_right_action(capsys):
@@ -525,7 +735,7 @@ def test_policy_can_lock_the_left_arm_without_changing_the_right_action(capsys):
     np.testing.assert_allclose(action[3:7], [1.0, 0.0, 0.0, 0.0])
     np.testing.assert_allclose(action[7], 0.3)
     np.testing.assert_allclose(action[8:15], _pose16()[8:15])
-    assert "left arm/gripper locked" in capsys.readouterr().out
+    assert "左臂和左夹爪已锁定" in capsys.readouterr().out
 
 
 def test_absolute_policy_locks_left_arm_to_last_executed_cmd():

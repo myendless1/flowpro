@@ -28,7 +28,7 @@ def _init_joint_action(value: str) -> list[list[float]]:
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="FlowPRO Astribot preference collector")
+    p = argparse.ArgumentParser(description="FlowPRO Astribot 偏好数据采集器")
     p.add_argument("--output", required=True)
     p.add_argument("--quest-state-url", default="")
     p.add_argument("--host", default="127.0.0.1")
@@ -36,7 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--prompt", default="perform the task")
     p.add_argument("--round", type=int, default=1)
     p.add_argument("--rollback-horizon", type=int, default=64)
-    p.add_argument("--rollback-capacity", type=int, default=200)
+    p.add_argument("--rollback-capacity", type=int, default=72)
     p.add_argument("--rollback-rate-hz", type=float, default=20)
     p.add_argument("--trigger-threshold", type=float, default=.5)
     p.add_argument("--control-rate-hz", type=float, default=10)
@@ -46,6 +46,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--replan-steps", type=int, default=8)
     p.add_argument("--state-history-len", type=int, default=16)
     p.add_argument("--obs-history-len", type=int, default=9)
+    p.add_argument("--image-from-s1-topic", dest="image_from_s1_topic", action="store_true")
+    p.add_argument("--sdk-image-polling", dest="image_from_s1_topic", action="store_false")
+    p.set_defaults(image_from_s1_topic=True)
+    p.add_argument("--camera-sync-slop-s", type=float, default=.05)
+    p.add_argument("--camera-sync-rate-hz", type=float, default=40.0)
     p.add_argument("--video-guidance-scale", type=float, default=1.0)
     p.add_argument("--action-guidance-scale", type=float, default=1.0)
     p.add_argument("--action-representation", choices=("absolute", "delta"), default="delta")
@@ -56,12 +61,13 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--gripper-trigger-threshold", type=float, default=.2)
     p.add_argument("--first-policy-waypoint-duration", type=float, default=.6)
     p.add_argument("--policy-waypoint-duration", type=float, default=.1)
+    p.add_argument("--policy-waypoint-batch-actions", type=int, default=8)
     p.add_argument("--disable-policy-left-arm", action="store_true")
     p.add_argument("--sdk-root", default="")
     p.add_argument(
         "--init-joint-action",
         type=_init_joint_action,
-        help="JSON six-group target: torso, left arm, left gripper, right arm, right gripper, head",
+        help="JSON 六组目标：躯干、左臂、左夹爪、右臂、右夹爪、头部",
     )
     p.add_argument("--reset-prelift-height-m", type=float, default=.10)
     p.add_argument("--reset-prelift-duration", type=float, default=1.0)
@@ -70,10 +76,33 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--right-xyz-low", type=float, nargs=3)
     p.add_argument("--right-xyz-high", type=float, nargs=3)
     p.add_argument("--right-min-z", type=float, default=.862)
-    p.add_argument("--fake", action="store_true", help="run a deterministic no-hardware collection smoke test")
+    p.add_argument(
+        "--disable-right-gripper-angle-constraint-during-takeover",
+        dest="right_gripper_angle_constraint_during_takeover",
+        action="store_false",
+    )
+    p.set_defaults(right_gripper_angle_constraint_during_takeover=True)
+    p.add_argument("--right-gripper-target-angle-deg", type=float, default=45.0)
+    p.add_argument(
+        "--right-gripper-ray-axis",
+        choices=("+x", "-x", "+y", "-y", "+z", "-z"),
+        default="+z",
+    )
+    p.add_argument(
+        "--disable-right-gripper-twist-level-constraint",
+        dest="right_gripper_twist_level_constraint",
+        action="store_false",
+    )
+    p.set_defaults(right_gripper_twist_level_constraint=True)
+    p.add_argument(
+        "--right-gripper-level-axis",
+        choices=("+x", "-x", "+y", "-y", "+z", "-z"),
+        default="+x",
+    )
+    p.add_argument("--fake", action="store_true", help="运行无需硬件的确定性采集冒烟测试")
     p.add_argument("--fake-pairs", type=int, default=1)
     p.add_argument("--target-pairs", type=int, default=0,
-                   help="stop after this many committed pairs; 0 keeps collecting")
+                   help="目录内有效样本总数达到该值后停止；0 表示持续采集")
     return p
 
 
@@ -105,8 +134,7 @@ def _wait_for_a_reset(
     episode: int,
 ) -> bool:
     print(
-        f"[Episode {episode}] Press A to raise both arms, then move the robot "
-        "to the initial pose.",
+        f"[第 {episode} 轮] 按 A 抬起双臂，并将机器人移动到初始位姿。",
         flush=True,
     )
     released = False
@@ -122,7 +150,7 @@ def _wait_for_a_reset(
 
 
 def _wait_for_a_start(controls: QuestControlSource, stopped, period: float, episode: int) -> bool:
-    print(f"[Episode {episode}] Prepare the scene, then press A to start policy inference.", flush=True)
+    print(f"[第 {episode} 轮] 请整理任务场景，准备完成后按 A 开始策略推理。", flush=True)
     released = False
     while not stopped():
         started = time.monotonic()
@@ -135,42 +163,6 @@ def _wait_for_a_start(controls: QuestControlSource, stopped, period: float, epis
     return False
 
 
-def _wait_for_chunk_decision(
-    controls: QuestControlSource,
-    stopped,
-    period: float,
-    *,
-    long_press_seconds: float = 2.0,
-) -> str:
-    print(
-        "Chunk complete: short press A=next chunk, hold A for 2s=finish episode, "
-        "B=rollback this chunk and enter takeover.",
-        flush=True,
-    )
-    buttons_released = False
-    previous_b = False
-    a_started: float | None = None
-    while not stopped():
-        started = time.monotonic()
-        control = controls.poll()
-        now = time.monotonic()
-        if not buttons_released:
-            buttons_released = not control.a and not control.b
-        else:
-            if control.b and not previous_b:
-                return "rollback"
-            if control.a:
-                if a_started is None:
-                    a_started = now
-                elif now - a_started >= long_press_seconds:
-                    return "finish"
-            elif a_started is not None:
-                return "continue"
-        previous_b = control.b
-        time.sleep(max(0.0, period - (time.monotonic() - started)))
-    return "stop"
-
-
 def _gate_takeover_retry_b(control: InputState, armed: bool) -> bool:
     """Ignore the rollback-triggering B hold until it has been released."""
     if armed:
@@ -181,15 +173,36 @@ def _gate_takeover_retry_b(control: InputState, armed: bool) -> bool:
     return False
 
 
+def _resume_progress(store: PairStore, target_pairs: int) -> tuple[int, int, bool]:
+    completed = store.completed_count()
+    next_episode = completed + 1
+    target_reached = int(target_pairs) > 0 and completed >= int(target_pairs)
+    return completed, next_episode, target_reached
+
+
 def main() -> None:
     args = _parser().parse_args()
     if args.fake:
-        print(f"collected {_run_fake(args)} fake preference pair(s)")
+        print(f"已采集 {_run_fake(args)} 组模拟偏好样本")
         return
     if not args.quest_state_url:
-        raise SystemExit("--quest-state-url is required unless --fake is used")
+        raise SystemExit("未使用 --fake 时必须提供 --quest-state-url")
     if not args.prompt.strip():
-        raise SystemExit("--prompt must describe the real robot task")
+        raise SystemExit("--prompt 必须描述真实机器人任务")
+
+    store = PairStore(args.output)
+    initial_pairs, first_episode, target_reached = _resume_progress(store, args.target_pairs)
+    if initial_pairs:
+        print(
+            f"检测到 {initial_pairs} 组已有有效样本，将从第 {initial_pairs + 1} 轮继续采集。",
+            flush=True,
+        )
+    if target_reached:
+        print(
+            f"目录内已有 {initial_pairs} 组有效样本，已达到目标 {args.target_pairs} 组。",
+            flush=True,
+        )
+        return
 
     runtime = AstribotRuntimeConfig(
         action_representation=args.action_representation,
@@ -203,6 +216,15 @@ def main() -> None:
         left_xyz_low=args.left_xyz_low, left_xyz_high=args.left_xyz_high,
         right_xyz_low=args.right_xyz_low, right_xyz_high=args.right_xyz_high,
         right_min_z=args.right_min_z,
+        right_gripper_angle_constraint_during_takeover=(
+            args.right_gripper_angle_constraint_during_takeover
+        ),
+        right_gripper_target_angle_deg=args.right_gripper_target_angle_deg,
+        right_gripper_ray_axis=args.right_gripper_ray_axis,
+        right_gripper_twist_level_constraint=(
+            args.right_gripper_twist_level_constraint
+        ),
+        right_gripper_level_axis=args.right_gripper_level_axis,
         takeover_max_translation_step_m=args.takeover_max_translation_step_m,
         takeover_max_rotation_step_deg=args.takeover_max_rotation_step_deg,
         takeover_max_gripper_step=args.takeover_max_gripper_step,
@@ -210,6 +232,9 @@ def main() -> None:
         policy_waypoint_duration=args.policy_waypoint_duration,
         state_history_len=args.state_history_len,
         obs_history_len=args.obs_history_len,
+        image_from_s1_topic=args.image_from_s1_topic,
+        camera_sync_slop_s=args.camera_sync_slop_s,
+        camera_sync_rate_hz=args.camera_sync_rate_hz,
     )
     robot = AstribotRobotIO(runtime)
     policy = WanVAPolicy(host=args.host, port=args.port, prompt=args.prompt,
@@ -226,10 +251,14 @@ def main() -> None:
         gripper_trigger_threshold=args.gripper_trigger_threshold,
     )
     collector = InterventionCollector(
-        robot, policy, PairStore(args.output), round_id=args.round,
+        robot, policy, store, round_id=args.round,
         rollback=RollbackConfig(args.rollback_capacity, args.rollback_horizon,
                                   1.0 / max(args.rollback_rate_hz, 1e-6)),
         trigger_threshold=args.trigger_threshold,
+        async_inference=True,
+        async_execution=True,
+        observation_rate_hz=args.camera_sync_rate_hz,
+        policy_waypoint_batch_actions=args.policy_waypoint_batch_actions,
     )
     stopped = False
 
@@ -240,15 +269,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     period = 1.0 / max(args.control_rate_hz, 1e-6)
+    policy_period = 1.0 / max(args.policy_rate_hz, 1e-6)
     takeover_period = 1.0 / max(args.takeover_rate_hz, 1e-6)
     record_period = 1.0 / max(args.record_rate_hz, 1e-6)
-    initial_pairs = sum(1 for path in PairStore(args.output).root.iterdir()
-                        if path.is_dir() and (path / "metadata.json").exists())
     committed = initial_pairs
-    episode = 1
+    episode = first_episode
     print(
-        "Collector ready: A=reset/start/next/finish, B=rollback/retry, "
-        "hold A 2s=finish, middle=takeover, Ctrl-C=stop",
+        "采集器已就绪：A=复位/开始/接管后保存，B=回退/重试，"
+        "middle=接管，Ctrl-C=停止",
         flush=True,
     )
     try:
@@ -258,9 +286,9 @@ def main() -> None:
                 controls, lambda: stopped, period, episode
             ):
                 break
-            print(f"[Episode {episode}] Moving to the initial pose...", flush=True)
+            print(f"[第 {episode} 轮] 正在移动到初始位姿...", flush=True)
             robot.move_to_initial_pose()
-            print(f"[Episode {episode}] Initial pose reached.", flush=True)
+            print(f"[第 {episode} 轮] 已到达初始位姿。", flush=True)
 
             controls.reset()
             collector.start_episode()
@@ -270,26 +298,48 @@ def main() -> None:
             episode_complete = False
             pair_saved = False
             retry_episode = False
-            while not stopped and not episode_complete:
-                print(f"[Episode {episode}] Executing one policy action chunk...", flush=True)
-                collector.tick(InputState())
-                decision = _wait_for_chunk_decision(controls, lambda: stopped, period)
-                if decision == "stop":
-                    break
-                if decision == "continue":
-                    print(f"[Episode {episode}] A short press: continuing to the next chunk.", flush=True)
-                    continue
-                if decision == "finish":
-                    print(f"[Episode {episode}] A held for 2s: episode finished.", flush=True)
-                    episode_complete = True
-                    continue
+            print(
+                f"[第 {episode} 轮] 策略已启动，将自动连续推理和执行；"
+                f"按 B 回退最近 {args.rollback_horizon} 步。",
+                flush=True,
+            )
+            next_policy = time.monotonic()
+            while not stopped and collector.phase in (Phase.POLICY, Phase.ARMED):
+                started = time.monotonic()
+                now = time.monotonic()
+                control = controls.poll()
+                control.policy_step = now >= next_policy
+                if control.policy_step:
+                    next_policy = now + policy_period
+                collector.tick(control)
+                if collector.last_policy_status == "inference_started":
+                    print(f"[第 {episode} 轮] 正在推理下一个 action chunk...", flush=True)
+                elif collector.last_policy_status == "chunk_started":
+                    print(
+                        f"[第 {episode} 轮] action chunk 已下发："
+                        "开始执行第一个 waypoint batch。",
+                        flush=True,
+                    )
+                elif collector.last_policy_status == "waypoint_batch_started":
+                    print(f"[第 {episode} 轮] 下一个 waypoint batch 已下发。", flush=True)
+                elif collector.last_policy_status == "waypoint_batch_finished":
+                    print(f"[第 {episode} 轮] 当前 waypoint batch 已执行完成。", flush=True)
+                elif collector.last_policy_status == "chunk_finished":
+                    print(f"[第 {episode} 轮] 当前 chunk 已执行完成，将自动继续。", flush=True)
+                elif collector.last_policy_status == "rollback_deferred":
+                    print(
+                        f"[第 {episode} 轮] 已收到 B：当前 waypoint batch 将继续执行完毕，"
+                        "随后自动回退；B 后动作不会计入负样本。",
+                        flush=True,
+                    )
+                time.sleep(max(0.0, period - (time.monotonic() - started)))
 
-                print(f"[Episode {episode}] B pressed: rolling back the completed chunk.", flush=True)
-                collector.tick(InputState(b=True))
-                collector.tick(InputState())
+            if stopped:
+                break
+            if collector.phase is Phase.ROLLED_BACK:
                 print(
-                    f"[Episode {episode}] Takeover active: hold middle to control and record; "
-                    "press A to save and finish; press B to discard and retry.",
+                    f"[第 {episode} 轮] 已进入接管：按住 middle 控制并记录；"
+                    "按 A 保存并结束；按 B 丢弃并重新采集本轮。",
                     flush=True,
                 )
                 next_takeover = next_record = time.monotonic()
@@ -326,30 +376,28 @@ def main() -> None:
 
                 if retry_episode:
                     print(
-                        f"[Episode {episode}] Pair discarded; restarting this episode.",
+                        f"[第 {episode} 轮] 已丢弃当前样本对，重新采集本轮。",
                         flush=True,
                     )
                 elif pair_saved:
-                    print(f"[Episode {episode}] Takeover pair saved; episode finished.", flush=True)
+                    print(f"[第 {episode} 轮] 本轮结束。", flush=True)
                 elif episode_complete:
                     print(
-                        f"[Episode {episode}] No correction recorded; episode finished without saving a pair.",
+                        f"[第 {episode} 轮] 未记录纠正动作，本轮结束且不保存样本对。",
                         flush=True,
                     )
-                if episode_complete:
-                    break
-
             if stopped:
                 break
             if retry_episode:
                 continue
             if pair_saved:
                 committed += 1
-                if args.target_pairs > 0 and committed - initial_pairs >= args.target_pairs:
-                    print(f"Target reached: {args.target_pairs} new preference pairs", flush=True)
+                if args.target_pairs > 0 and committed >= args.target_pairs:
+                    print(f"已达到目标：目录内共有 {committed} 组偏好样本", flush=True)
                     break
             episode += 1
     finally:
+        collector.close()
         # Re-issue the measured pose so a filtered Cartesian controller holds
         # position if Quest disconnects, the operator interrupts, or a safety
         # check aborts collection.
@@ -357,7 +405,7 @@ def main() -> None:
             state = robot.state_action16()
             robot.execute_absolute(state)
         except Exception as exc:
-            print(f"WARNING: failed to send final hold command: {exc}", flush=True)
+            print(f"警告：发送最终保持位姿命令失败：{exc}", flush=True)
 
 
 if __name__ == "__main__":
